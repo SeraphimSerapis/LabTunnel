@@ -346,11 +346,12 @@ final class TunnelTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("pids-\(UUID()).json")
         defer { try? FileManager.default.removeItem(at: url) }
 
-        // Both hang in the proxy command instead of touching the network.
+        // Both hang in the proxy command instead of touching the network. ssh already prefixes
+        // the command with `exec`, and bash rejects a second one, so write it without.
         func spawnSSH(_ extra: [String]) throws -> Process {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            p.arguments = extra + ["-o", "ProxyCommand=exec sleep 30", "-o", "BatchMode=yes", "example.invalid"]
+            p.arguments = extra + ["-o", "ProxyCommand=sleep 30", "-o", "BatchMode=yes", "example.invalid"]
             // Detach from the test runner's pipes, or the lingering `sleep` keeps `swift test` waiting.
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
@@ -362,6 +363,7 @@ final class TunnelTests: XCTestCase {
         let ours = try spawnSSH(["-N", "-o", "ControlPath=none", "-L", "127.0.0.1:22999:127.0.0.1:22"])
         defer { unrelated.terminate(); ours.terminate() }
         usleep(300_000)
+        XCTAssertTrue(unrelated.isRunning && ours.isRunning, "both must be alive, or the reap proves nothing")
 
         let registry = PIDRegistry(url: url)
         registry.add(unrelated.processIdentifier)

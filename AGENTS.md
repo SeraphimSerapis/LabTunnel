@@ -34,7 +34,7 @@ Start the app before the CLI. Otherwise the CLI launches the registered LabTunne
 ## Tests
 
 - Tests stay off the network and out of the real data directory. Give `TunnelManager` a temporary `storeURL`. Put test sockets under `/tmp` with a short name, because Unix socket paths are limited to 104 bytes and `$TMPDIR` can exceed that.
-- A test that needs a live `ssh` process spawns `/usr/bin/ssh` with `-o ProxyCommand=exec sleep 30`, so it never connects anywhere. `testReapSparesUnrelatedSSHSessionsAndKillsOurTunnels` shows the pattern.
+- A test that needs a live `ssh` process spawns `/usr/bin/ssh` with `-o ProxyCommand=sleep 30`, so it never connects anywhere. Leave `exec` out: `ssh` adds its own, and bash, the shell on CI, rejects a second one. `testReapSparesUnrelatedSSHSessionsAndKillsOurTunnels` shows the pattern.
 
 ## Style
 
