@@ -1,7 +1,13 @@
-# LabTunnel
+<h1 align="center">
+  <img src="docs/banner.png" alt="LabTunnel" width="800">
+</h1>
 
-[![CI](https://github.com/SeraphimSerapis/LabTunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/SeraphimSerapis/LabTunnel/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/SeraphimSerapis/LabTunnel/releases/latest"><img src="https://img.shields.io/github/v/release/SeraphimSerapis/LabTunnel" alt="Latest release"></a>
+  <a href="https://github.com/SeraphimSerapis/LabTunnel/actions/workflows/ci.yml"><img src="https://github.com/SeraphimSerapis/LabTunnel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20silicon-black?logo=apple" alt="macOS 14+ on Apple silicon">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
 
 LabTunnel is a macOS menu bar app that forwards a port on an SSH host to `127.0.0.1` on your Mac. If Grafana on your homelab server only listens on that server's localhost port 3000, LabTunnel makes it available at `http://127.0.0.1:3000` in your browser.
 
@@ -237,7 +243,7 @@ swift test                                     # unit and integration tests, no 
 | `scripts/` | Build, install, notarize and icon scripts. |
 | `Resources/` | `Info.plist` and the app icon. |
 
-Maintainers cut a release with `./scripts/release.sh`. It builds from a clean commit, signs with the local Developer ID certificate, notarizes and staples the app with `./scripts/notarize.sh`, and writes `build/LabTunnel-<version>.zip`. It takes the version from `Resources/Info.plist` and prints the `git tag` and `gh release create` commands without running them. The headers of both scripts describe the one-time setup. `./scripts/make-icon.sh` regenerates `Resources/AppIcon.icns` after you edit `scripts/make-icon.swift`.
+Maintainers cut a release with `./scripts/release.sh`. It builds from a clean commit, signs with the local Developer ID certificate, notarizes and staples the app with `./scripts/notarize.sh`, and writes `build/LabTunnel-<version>.zip`. It takes the version from `Resources/Info.plist` and prints the `git tag` and `gh release create` commands without running them. The headers of both scripts describe the one-time setup. `./scripts/make-icon.sh` regenerates `Resources/AppIcon.icns` after you edit `scripts/make-icon.swift`. `swift scripts/make-banner.swift docs/banner.png` redraws the README banner from the icon.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. Report security issues as described in [SECURITY.md](SECURITY.md).
 
