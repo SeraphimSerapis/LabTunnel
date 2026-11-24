@@ -26,10 +26,12 @@ public enum UnixSocket {
 
     private static func errnoMessage() -> String { String(cString: strerror(errno)) }
 
-    /// Receive timeout and no SIGPIPE: a peer that vanishes mid-write must not kill the app.
+    /// Receive/send timeouts and no SIGPIPE: a peer that vanishes mid-write must not kill the app.
     public static func configure(_ fd: Int32, timeoutSeconds: Int) {
         var timeout = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        let size = socklen_t(MemoryLayout<timeval>.size)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, size)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, size)
         var on: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
     }
@@ -77,15 +79,26 @@ public enum UnixSocket {
         return fd
     }
 
-    /// Reads up to the first newline. Nil on EOF before any data, timeout, or oversized input.
+    /// Reads up to the first newline. Nil on EOF before any data, timeout/error, or oversized input.
     public static func readLine(_ fd: Int32, maxBytes: Int = 1 << 20) -> Data? {
+        guard maxBytes > 0 else { return nil }
         var data = Data()
         var chunk = [UInt8](repeating: 0, count: 4096)
-        while data.count < maxBytes {
-            let count = read(fd, &chunk, chunk.count)
-            if count <= 0 { return data.isEmpty ? nil : data }
+        while data.count <= maxBytes {
+            var count: Int
+            repeat {
+                count = read(fd, &chunk, chunk.count)
+            } while count < 0 && errno == EINTR
+
+            if count < 0 { return nil }
+            if count == 0 { return data.isEmpty ? nil : data }
+
+            if let newline = chunk[..<count].firstIndex(of: 0x0A) {
+                guard data.count + newline <= maxBytes else { return nil }
+                data.append(chunk, count: newline)
+                return data
+            }
             data.append(chunk, count: count)
-            if let newline = data.firstIndex(of: 0x0A) { return data.prefix(upTo: newline) }
         }
         return nil
     }
@@ -95,11 +108,54 @@ public enum UnixSocket {
         bytes.append(0x0A)
         var offset = 0
         bytes.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
             while offset < buffer.count {
-                let written = write(fd, buffer.baseAddress! + offset, buffer.count - offset)
-                if written <= 0 { return }
+                let written = write(fd, base + offset, buffer.count - offset)
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    return
+                }
+                if written == 0 { return }
                 offset += written
             }
         }
+    }
+}
+
+/// Advisory file lock keeping a single running app instance per data directory.
+public final class InstanceLock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32
+
+    private init(fd: Int32) {
+        self.fd = fd
+    }
+
+    deinit {
+        release()
+    }
+
+    public static func acquire(at url: URL) -> InstanceLock? {
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let fd = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(0o600))
+        guard fd >= 0 else { return nil }
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            close(fd)
+            return nil
+        }
+        return InstanceLock(fd: fd)
+    }
+
+    public func release() {
+        lock.lock()
+        let currentFD = fd
+        fd = -1
+        lock.unlock()
+        guard currentFD >= 0 else { return }
+        flock(currentFD, LOCK_UN)
+        close(currentFD)
     }
 }

@@ -10,6 +10,17 @@ public enum AgentSetup {
         public let skillFile: URL
     }
 
+    public struct Status: Equatable {
+        public let cliInstalled: Bool
+        public let cliMatchesBundle: Bool
+        public let skillInstalled: Bool
+        public let skillUpToDate: Bool
+        public let cliLink: URL
+        public let skillFile: URL
+
+        public var isComplete: Bool { cliInstalled && cliMatchesBundle && skillInstalled && skillUpToDate }
+    }
+
     public struct Failure: Error, CustomStringConvertible {
         public let description: String
         init(_ description: String) { self.description = description }
@@ -21,6 +32,55 @@ public enum AgentSetup {
 
     public static func skillSourceURL(in appBundle: URL) -> URL {
         appBundle.appendingPathComponent("Contents/Resources/skill/SKILL.md")
+    }
+
+    public static func status(
+        appBundle: URL?,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> Status {
+        let fm = FileManager.default
+        let cliLink = home.appendingPathComponent(".local/bin/labtunnel")
+        let skillFile = home.appendingPathComponent(".agents/skills/labtunnel/SKILL.md")
+
+        let linkType = try? fm.attributesOfItem(atPath: cliLink.path)[.type] as? FileAttributeType
+        let resolvedCLI = cliLink.resolvingSymlinksInPath()
+        let targetType = try? fm.attributesOfItem(atPath: resolvedCLI.path)[.type] as? FileAttributeType
+        let cliInstalled = linkType == .typeSymbolicLink
+            && targetType == .typeRegular
+            && fm.isExecutableFile(atPath: resolvedCLI.path)
+
+        let cliMatchesBundle: Bool
+        if let appBundle {
+            let expected = helperURL(in: appBundle).resolvingSymlinksInPath()
+            cliMatchesBundle = cliInstalled && resolvedCLI.path == expected.path
+        } else {
+            cliMatchesBundle = cliInstalled
+        }
+
+        var isSkillDir: ObjCBool = false
+        let skillInstalled = fm.fileExists(atPath: skillFile.path, isDirectory: &isSkillDir) && !isSkillDir.boolValue
+
+        let skillUpToDate: Bool
+        if let appBundle {
+            if skillInstalled,
+               let installedData = try? Data(contentsOf: skillFile),
+               let bundleData = try? Data(contentsOf: skillSourceURL(in: appBundle)) {
+                skillUpToDate = installedData == bundleData
+            } else {
+                skillUpToDate = false
+            }
+        } else {
+            skillUpToDate = skillInstalled
+        }
+
+        return Status(
+            cliInstalled: cliInstalled,
+            cliMatchesBundle: cliMatchesBundle,
+            skillInstalled: skillInstalled,
+            skillUpToDate: skillUpToDate,
+            cliLink: cliLink,
+            skillFile: skillFile
+        )
     }
 
     public static func install(

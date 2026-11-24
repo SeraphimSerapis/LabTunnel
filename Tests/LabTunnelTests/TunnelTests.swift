@@ -1,4 +1,5 @@
 import Foundation
+import LabTunnelControl
 import XCTest
 @testable import LabTunnel
 
@@ -205,11 +206,20 @@ final class TunnelTests: XCTestCase {
     // MARK: Traffic
 
     func testNettopRowParsing() {
-        XCTAssertEqual(TrafficMonitor.parse("ssh.36789,390,870,")?.up, 390)
-        XCTAssertEqual(TrafficMonitor.parse("ssh.36789,390,870,")?.down, 870)
+        let sshRow = TrafficMonitor.parse("ssh.36789,390,870,")
+        XCTAssertEqual(sshRow?.pid, 36789)
+        XCTAssertEqual(sshRow?.up, 390)
+        XCTAssertEqual(sshRow?.down, 870)
+
+        let curlRow = TrafficMonitor.parse("curl.1234,5,6,")
+        XCTAssertEqual(curlRow?.pid, 1234)
+        XCTAssertEqual(curlRow?.up, 5)
+        XCTAssertEqual(curlRow?.down, 6)
+
         XCTAssertNil(TrafficMonitor.parse(",bytes_in,bytes_out,"))
-        XCTAssertNil(TrafficMonitor.parse("curl.1234,5,6,"))
+        XCTAssertNil(TrafficMonitor.parse("ssh.0,5,6,"))
         XCTAssertNil(TrafficMonitor.parse("ssh.1,abc,6,"))
+        XCTAssertNil(TrafficMonitor.parse("nosuffix,1,2,"))
         XCTAssertNil(TrafficMonitor.parse(""))
     }
 
@@ -438,5 +448,232 @@ final class ManagerTests: XCTestCase {
         XCTAssertTrue(manager.isNameTaken(" grafana ", except: nil))
         XCTAssertFalse(manager.isNameTaken("GRAFANA", except: web.id), "a tunnel may keep its own name")
         XCTAssertFalse(manager.isNameTaken("Prometheus", except: nil))
+    }
+
+    func testGroupsConsolidateCaseInsensitivelyAndToggleTogether() throws {
+        let manager = try makeLiveManager()
+        let t1 = Tunnel(name: "one", host: "a", remotePort: 1, localPort: freeLocalPort(), group: "media")
+        let t2 = Tunnel(name: "two", host: "a", remotePort: 2, localPort: freeLocalPort(), group: "Dev")
+        let t3 = Tunnel(name: "three", host: "a", remotePort: 3, localPort: freeLocalPort(), group: "MEDIA")
+        let t4 = Tunnel(name: "four", host: "a", remotePort: 4, localPort: freeLocalPort())
+        manager.save(t1)
+        manager.save(t2)
+        manager.save(t3)
+        manager.save(t4)
+
+        XCTAssertEqual(manager.knownGroups, ["Dev", "media"])
+        XCTAssertEqual(manager.sections.map(\.name), ["", "Dev", "media"])
+        XCTAssertEqual(manager.sections[2].tunnels.map(\.name), ["one", "three"])
+
+        manager.setGroup("MEDIA", connected: true)
+        XCTAssertEqual(manager.state(of: t1), .connecting)
+        XCTAssertEqual(manager.state(of: t2), .idle)
+        XCTAssertEqual(manager.state(of: t3), .connecting)
+        XCTAssertEqual(manager.activeCount, 2)
+
+        manager.setGroup("Media", connected: false)
+        XCTAssertEqual(manager.state(of: t1), .idle)
+        XCTAssertEqual(manager.state(of: t3), .idle)
+        XCTAssertEqual(manager.activeCount, 0)
+    }
+
+    func testWaitForSettlementWakesPromptlyAndReportsTimeoutOnlyWhileUnsettled() async throws {
+        let manager = try makeLiveManager()
+        let tunnel = Tunnel(name: "web", host: "box", remotePort: 80, localPort: freeLocalPort())
+        manager.save(tunnel)
+
+        // Idle tunnel is already settled.
+        let idleTimedOut = await manager.waitForSettlement(ids: [tunnel.id], timeout: 1.0)
+        XCTAssertFalse(idleTimedOut)
+
+        // Connecting tunnel with fake ssh never binds a port, so a short timeout expires.
+        manager.connect(tunnel)
+        XCTAssertEqual(manager.state(of: tunnel), .connecting)
+        let shortTimedOut = await manager.waitForSettlement(ids: [tunnel.id], timeout: 0.1)
+        XCTAssertTrue(shortTimedOut)
+
+        // Disconnecting mid-wait wakes the waiter immediately instead of waiting 5 seconds.
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        let disconnector = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(50))
+            manager.disconnect(tunnel)
+        }
+        let wokenTimedOut = await manager.waitForSettlement(ids: [tunnel.id], timeout: 5.0)
+        _ = await disconnector.value
+        XCTAssertFalse(wokenTimedOut)
+        XCTAssertLessThan(clock.now - startedAt, .seconds(2))
+    }
+
+    func testDisconnectAllClearsProcessesStatesAndPIDRegistry() throws {
+        let storeURL = temporaryStoreURL()
+        let pidURL = storeURL.deletingLastPathComponent().appendingPathComponent("ssh-pids.json")
+        let manager = TunnelManager(storeURL: storeURL, sshExecutable: try makeFakeSSH(), monitorNetwork: false)
+        let t1 = Tunnel(name: "a", host: "box", remotePort: 80, localPort: freeLocalPort())
+        let t2 = Tunnel(name: "b", host: "box", remotePort: 81, localPort: freeLocalPort())
+        manager.save(t1)
+        manager.save(t2)
+        manager.connectAll()
+
+        XCTAssertEqual(manager.activeCount, 2)
+        XCTAssertEqual(manager.state(of: t1), .connecting)
+        XCTAssertEqual(manager.state(of: t2), .connecting)
+
+        manager.disconnectAll()
+        XCTAssertEqual(manager.activeCount, 0)
+        XCTAssertEqual(manager.state(of: t1), .idle)
+        XCTAssertEqual(manager.state(of: t2), .idle)
+        XCTAssertNil(manager.localPorts[t1.id])
+        XCTAssertNil(manager.connectedSince[t1.id])
+        let recordedPIDs = try JSONDecoder().decode([Int32].self, from: Data(contentsOf: pidURL))
+        XCTAssertEqual(recordedPIDs, [])
+    }
+
+    func testReconnectingPreservesStateAcrossProcessRestart() async throws {
+        let fakeListener = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fake-listen-ssh-\(UUID().uuidString)")
+        // Extract local port from `-L 127.0.0.1:<port>:...`, listen on loopback until terminated.
+        let script = """
+        #!/bin/sh
+        port=""
+        prev=""
+        for arg in "$@"; do
+          if [ "$prev" = "-L" ]; then
+            rest="${arg#127.0.0.1:}"
+            port="${rest%%:*}"
+            break
+          fi
+          prev="$arg"
+        done
+        exec /usr/bin/nc -l 127.0.0.1 "$port"
+        """
+        try script.write(to: fakeListener, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeListener.path)
+        addTeardownBlock { try? FileManager.default.removeItem(at: fakeListener) }
+
+        let manager = TunnelManager(storeURL: temporaryStoreURL(), sshExecutable: fakeListener, monitorNetwork: false)
+        addTeardownBlock { @MainActor in manager.disconnectAll() }
+        let port = freeLocalPort()
+        let tunnel = Tunnel(name: "live", host: "box", remotePort: 80, localPort: port)
+        manager.save(tunnel)
+        manager.connect(tunnel)
+
+        let connected = await manager.waitForSettlement(ids: [tunnel.id], timeout: 5.0)
+        XCTAssertFalse(connected)
+        XCTAssertEqual(manager.state(of: tunnel), .connected)
+        XCTAssertNotNil(manager.uptimeSeconds(of: tunnel))
+
+        // Verify ControlHandler status reflects connected state before simulating drop.
+        let helper = ControlHandler(manager: manager)
+        XCTAssertEqual(helper.status(tunnel).state, "connected")
+
+        // Connect to the listening nc process once and close, causing nc to exit and trigger auto-reconnect.
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port)).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        _ = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        close(fd)
+
+        let deadline = ContinuousClock().now + .seconds(3)
+        while manager.state(of: tunnel) != .reconnecting && ContinuousClock().now < deadline {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(manager.state(of: tunnel), .reconnecting)
+        XCTAssertEqual(manager.reconnectingCount, 1)
+
+        // Wait past the 1s first retry backoff; start() must keep .reconnecting instead of flickering to .connecting.
+        try? await Task.sleep(for: .milliseconds(1150))
+        XCTAssertNotEqual(manager.state(of: tunnel), .connecting)
+    }
+
+    func testControlServerDirectoryPermissionsStaySafeOutsideTmp() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("lt-perm-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let socketURL = dir.appendingPathComponent("c.sock")
+        let manager = TunnelManager(storeURL: dir.appendingPathComponent("tunnels.json"), monitorNetwork: false)
+        let server = ControlServer(manager: manager, socketURL: socketURL)
+        try server.start()
+        defer { server.stop() }
+
+        let dirMode = try FileManager.default.attributesOfItem(atPath: dir.path)[.posixPermissions] as? Int
+        XCTAssertEqual(dirMode, 0o700)
+        let tmpMode = try FileManager.default.attributesOfItem(atPath: "/private/tmp")[.posixPermissions] as? Int
+        XCTAssertNotEqual(tmpMode, 0o700)
+    }
+
+    func testControlHandlerRemoteHostRecheckHostsAndVersion() async throws {
+        let manager = try makeLiveManager()
+        let handler = ControlHandler(manager: manager)
+
+        let added = handler.handle(ControlRequest(
+            command: "add",
+            fields: TunnelFields(name: "db", host: "bastion", remotePort: 5432, remoteHost: " 10.0.0.5 ")
+        ))
+        XCTAssertTrue(added.ok)
+        XCTAssertEqual(added.tunnels.first?.remoteHost, "10.0.0.5")
+
+        let defaultAdded = handler.handle(ControlRequest(
+            command: "add",
+            fields: TunnelFields(name: "web", host: "bastion", remotePort: 80)
+        ))
+        XCTAssertTrue(defaultAdded.ok)
+        XCTAssertNil(defaultAdded.tunnels.first?.remoteHost)
+
+        let updated = handler.handle(ControlRequest(
+            command: "update",
+            targets: ["db"],
+            fields: TunnelFields(remoteHost: "127.0.0.1")
+        ))
+        XCTAssertTrue(updated.ok)
+        XCTAssertNil(updated.tunnels.first?.remoteHost)
+
+        let badRemoteHost = handler.handle(ControlRequest(
+            command: "update",
+            targets: ["db"],
+            fields: TunnelFields(remoteHost: "-bad")
+        ))
+        XCTAssertEqual(badRemoteHost.code, "invalid")
+
+        let recheckMissing = handler.handle(ControlRequest(command: "recheck", targets: ["missing"]))
+        XCTAssertEqual(recheckMissing.code, "not_found")
+        let recheckOK = handler.handle(ControlRequest(command: "recheck", targets: ["db"]))
+        XCTAssertTrue(recheckOK.ok)
+        XCTAssertEqual(recheckOK.tunnels.map(\.name), ["db"])
+
+        let hosts = handler.handle(ControlRequest(command: "hosts"))
+        XCTAssertTrue(hosts.ok)
+        XCTAssertNotNil(hosts.hosts)
+
+        let version = handler.handle(ControlRequest(command: "version"))
+        XCTAssertTrue(version.ok)
+        XCTAssertFalse((version.version ?? "").isEmpty)
+
+        // Verify ControlServer wait command over socket.
+        let socketURL = URL(fileURLWithPath: "/tmp/lt-wait-\(UUID().uuidString.prefix(8)).sock")
+        let server = ControlServer(manager: manager, socketURL: socketURL)
+        try server.start()
+        defer { server.stop() }
+
+        let client = ControlClient(socketURL: socketURL)
+        let waitIdle = try await Task.detached {
+            try client.send(ControlRequest(command: "wait", targets: ["db"], timeout: 1.0))
+        }.value
+        XCTAssertTrue(waitIdle.ok)
+        XCTAssertNil(waitIdle.code)
+        XCTAssertEqual(waitIdle.tunnels.first?.state, "idle")
+
+        _ = handler.handle(ControlRequest(command: "connect", targets: ["db"]))
+        let waitTimeout = try await Task.detached {
+            try client.send(ControlRequest(command: "wait", targets: ["db"], timeout: 0.1))
+        }.value
+        XCTAssertTrue(waitTimeout.ok)
+        XCTAssertEqual(waitTimeout.code, "timeout")
     }
 }

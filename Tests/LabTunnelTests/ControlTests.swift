@@ -80,8 +80,89 @@ final class CLIParsingTests: XCTestCase {
 
     func testHelpAndSetup() throws {
         XCTAssertEqual(try Parsing.parse([]), .help)
+        XCTAssertEqual(try Parsing.parse(["help"]), .help)
         XCTAssertEqual(try Parsing.parse(["--help"]), .help)
+        XCTAssertEqual(try Parsing.parse(["add", "--help"]), .help)
+        XCTAssertEqual(try Parsing.parse(["connect", "-h"]), .help)
+        XCTAssertEqual(try Parsing.parse(["open", "web", "--help"]), .help)
+        XCTAssertEqual(try Parsing.parse(["version", "-h"]), .help)
+        XCTAssertEqual(try Parsing.parse(["doctor", "--help"]), .help)
         XCTAssertEqual(try Parsing.parse(["setup"]), .setup)
+        XCTAssertThrowsError(try Parsing.parse(["setup", "extra"]))
+    }
+
+    func testDoubleDashStopsOptionParsing() throws {
+        let (status, _) = try request(["status", "--", "-h"])
+        XCTAssertEqual(status.command, "status")
+        XCTAssertEqual(status.targets, ["-h"])
+
+        let (connect, _) = try request(["connect", "--", "--help"])
+        XCTAssertEqual(connect.command, "connect")
+        XCTAssertEqual(connect.targets, ["--help"])
+
+        let (update, _) = try request(["update", "--host", "box", "--", "--my-tunnel"])
+        XCTAssertEqual(update.fields.host, "box")
+        XCTAssertEqual(update.targets, ["--my-tunnel"])
+    }
+
+    func testRemoteHostAndChangesConnection() throws {
+        let (added, _) = try request([
+            "add", "--name", "db", "--host", "bastion", "--remote-host", "10.0.0.5", "--remote-port", "5432",
+        ])
+        XCTAssertEqual(added.fields.remoteHost, "10.0.0.5")
+        XCTAssertTrue(added.fields.changesConnection)
+
+        let (updated, _) = try request(["update", "db", "--remote-host=10.0.0.6"])
+        XCTAssertEqual(updated.fields.remoteHost, "10.0.0.6")
+        XCTAssertTrue(updated.fields.changesConnection)
+
+        let (renamed, _) = try request(["update", "db", "--name", "db2"])
+        XCTAssertFalse(renamed.fields.changesConnection)
+
+        XCTAssertThrowsError(try Parsing.parse(["list", "--remote-host", "10.0.0.5"]))
+    }
+
+    func testOpenRecheckHostsVersionAndDoctorParsing() throws {
+        XCTAssertEqual(
+            try Parsing.parse(["open", "web"]),
+            .open(target: "web", connectIfIdle: true, options: Options())
+        )
+        XCTAssertEqual(
+            try Parsing.parse(["open", "web", "--no-connect", "--timeout", "7.5", "--json"]),
+            .open(target: "web", connectIfIdle: false, options: Options(json: true, wait: true, timeout: 7.5))
+        )
+        XCTAssertThrowsError(try Parsing.parse(["open"]))
+        XCTAssertThrowsError(try Parsing.parse(["open", "a", "b"]))
+        XCTAssertThrowsError(try Parsing.parse(["open", "--group", "G", "a"]))
+        XCTAssertThrowsError(try Parsing.parse(["open", "--all"]))
+        XCTAssertThrowsError(try Parsing.parse(["connect", "web", "--no-connect"]))
+
+        let (recheck, recheckOpts) = try request(["recheck", "--group", "AI", "--json"])
+        XCTAssertEqual(recheck.command, "recheck")
+        XCTAssertEqual(recheck.group, "AI")
+        XCTAssertTrue(recheckOpts.json)
+        XCTAssertThrowsError(try Parsing.parse(["recheck"]))
+        XCTAssertThrowsError(try Parsing.parse(["recheck", "web", "--no-wait"]))
+        XCTAssertThrowsError(try Parsing.parse(["recheck", "web", "--timeout", "5"]))
+        XCTAssertThrowsError(try Parsing.parse(["recheck", "web", "--connect"]))
+
+        let (hosts, hostsOpts) = try request(["hosts", "--json"])
+        XCTAssertEqual(hosts.command, "hosts")
+        XCTAssertTrue(hostsOpts.json)
+        XCTAssertThrowsError(try Parsing.parse(["hosts", "extra"]))
+        XCTAssertThrowsError(try Parsing.parse(["hosts", "--all"]))
+        XCTAssertThrowsError(try Parsing.parse(["hosts", "--group", "G"]))
+
+        XCTAssertEqual(try Parsing.parse(["version"]), .version(json: false))
+        XCTAssertEqual(try Parsing.parse(["--version"]), .version(json: false))
+        XCTAssertEqual(try Parsing.parse(["-v"]), .version(json: false))
+        XCTAssertEqual(try Parsing.parse(["version", "--json"]), .version(json: true))
+        XCTAssertThrowsError(try Parsing.parse(["version", "extra"]))
+
+        XCTAssertEqual(try Parsing.parse(["doctor"]), .doctor(json: false))
+        XCTAssertEqual(try Parsing.parse(["doctor", "--json"]), .doctor(json: true))
+        XCTAssertThrowsError(try Parsing.parse(["doctor", "--bogus"]))
+        XCTAssertThrowsError(try Parsing.parse(["doctor", "extra"]))
     }
 
     func testFindsAppBundleFromHelperPathOnly() {
@@ -102,6 +183,37 @@ final class CLIParsingTests: XCTestCase {
         t.error = "Permission denied"
         XCTAssertEqual(Rendering.connectResult(t), "failed web: Permission denied")
         XCTAssertEqual(Rendering.table([]), "No tunnels.")
+    }
+
+    func testRenderingRemoteHostUptimeRatesHostsAndDoctor() {
+        XCTAssertEqual(Rendering.uptime(45), "45s")
+        XCTAssertEqual(Rendering.uptime(725), "12m 5s")
+        XCTAssertEqual(Rendering.uptime(8040), "2h 14m")
+        XCTAssertEqual(Rendering.uptime(90_000), "1d 1h")
+
+        let forwarded = TunnelStatus(
+            id: "1", name: "db", host: "bastion", remotePort: 5432, localPort: 15432, scheme: "tcp",
+            group: "Infra", connectOnLaunch: false, useFreePortIfBusy: false, state: "connected",
+            activeLocalPort: 15432, remote: "listening",
+            traffic: TrafficStatus(up: 1536, down: 4096, upRate: 120, downRate: 2048),
+            remoteHost: "10.0.0.5", uptimeSeconds: 725
+        )
+        XCTAssertTrue(Rendering.table([forwarded]).contains("bastion -> 10.0.0.5:5432"))
+        XCTAssertEqual(Rendering.summary(verb: "added", forwarded), "added db (bastion -> 10.0.0.5:5432 -> 127.0.0.1:15432)")
+        let detail = Rendering.detail(forwarded)
+        XCTAssertTrue(detail.contains("target:    bastion -> 10.0.0.5:5432"))
+        XCTAssertTrue(detail.contains("uptime:    12m 5s"))
+        XCTAssertTrue(detail.contains("120 B/s"))
+        XCTAssertTrue(detail.contains("/s)"))
+
+        XCTAssertEqual(Rendering.hosts([]), "No hosts found in ~/.ssh/config.")
+        XCTAssertEqual(Rendering.hosts(["alpha", "beta"]), "alpha\nbeta")
+
+        let report = DoctorReport(ok: false, checks: [
+            DoctorCheck(name: "app", level: .ok, detail: "Running."),
+            DoctorCheck(name: "ssh", level: .fail, detail: "Missing."),
+        ])
+        XCTAssertEqual(Rendering.doctor(report), "[ok] app: Running.\n[fail] ssh: Missing.")
     }
 }
 
@@ -428,5 +540,297 @@ final class AgentSetupTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".local").path),
                        "a failed setup must not leave partial state behind")
+    }
+}
+
+// MARK: CLI behavior against mock control socket
+
+private final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    func withValue<T>(_ body: (inout Value) -> T) -> T {
+        lock.withLock { body(&value) }
+    }
+}
+
+private final class MockControlServer: @unchecked Sendable {
+    let socketURL: URL
+    private let fd: Int32
+    private let source: DispatchSourceRead
+    private let queue = DispatchQueue(label: "test.mock.control", attributes: .concurrent)
+
+    init(handler: @escaping @Sendable (ControlRequest) -> ControlResponse) throws {
+        socketURL = URL(fileURLWithPath: "/tmp/lt-mock-\(UUID().uuidString.prefix(8)).sock")
+        fd = try UnixSocket.listen(path: socketURL.path)
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: DispatchQueue(label: "test.mock.accept"))
+        let serverFD = fd
+        let workQueue = queue
+        source.setEventHandler {
+            let client = accept(serverFD, nil, nil)
+            guard client >= 0 else { return }
+            workQueue.async {
+                defer { close(client) }
+                UnixSocket.configure(client, timeoutSeconds: 5)
+                guard let line = UnixSocket.readLine(client) else { return }
+                let response: ControlResponse
+                if let req = try? JSONDecoder().decode(ControlRequest.self, from: line) {
+                    response = handler(req)
+                } else {
+                    response = .failure("usage", "bad json")
+                }
+                if let payload = try? JSONEncoder().encode(response) {
+                    UnixSocket.writeLine(client, payload)
+                }
+            }
+        }
+        source.setCancelHandler { close(serverFD) }
+        source.resume()
+        self.source = source
+    }
+
+    func stop() {
+        source.cancel()
+        unlink(socketURL.path)
+    }
+}
+
+final class CLIBehaviorTests: XCTestCase {
+    private func status(
+        id: String = "11111111-1111-1111-1111-111111111111",
+        name: String = "web",
+        scheme: String = "http",
+        state: String = "connected",
+        error: String? = nil,
+        remote: String = "listening",
+        url: String? = "http://127.0.0.1:3000"
+    ) -> TunnelStatus {
+        TunnelStatus(
+            id: id, name: name, host: "homelab", remotePort: 3000, localPort: 3000,
+            scheme: scheme, group: "", connectOnLaunch: false, useFreePortIfBusy: false,
+            state: state, error: error, activeLocalPort: state == "idle" || state == "failed" ? nil : 3000,
+            url: state == "connected" ? url : nil, remote: remote
+        )
+    }
+
+    func testWaitForConnectionsUsesServerWaitWithoutPolling() throws {
+        let commands = Locked([String]())
+        let connected = status()
+        let server = try MockControlServer { req in
+            commands.withValue { $0.append(req.command) }
+            if req.command == "wait" {
+                return ControlResponse(ok: true, tunnels: [connected])
+            }
+            return .failure("internal", "unexpected polling command \(req.command)")
+        }
+        defer { server.stop() }
+
+        let initial = ControlResponse(ok: true, tunnels: [status(state: "connecting", remote: "unknown", url: nil)])
+        let (result, timedOut) = try CLI.waitForConnections(initial, options: Options(timeout: 5), client: ControlClient(socketURL: server.socketURL))
+        XCTAssertFalse(timedOut)
+        XCTAssertEqual(result.tunnels.first?.state, "connected")
+        XCTAssertEqual(commands.withValue { $0 }, ["wait"])
+    }
+
+    func testWaitForConnectionsReportsServerWaitTimeout() throws {
+        let connecting = status(state: "connecting", remote: "unknown", url: nil)
+        let server = try MockControlServer { req in
+            if req.command == "wait" {
+                return ControlResponse(ok: true, error: "Timed out waiting for the tunnel to connect.", code: "timeout", tunnels: [connecting])
+            }
+            return .failure("internal", "unexpected")
+        }
+        defer { server.stop() }
+
+        let initial = ControlResponse(ok: true, tunnels: [connecting])
+        let (result, timedOut) = try CLI.waitForConnections(initial, options: Options(timeout: 5), client: ControlClient(socketURL: server.socketURL))
+        XCTAssertTrue(timedOut)
+        XCTAssertEqual(result.code, "timeout")
+    }
+
+    func testWaitForConnectionsFallbackDoesNotTimeoutWhenAlreadySettled() throws {
+        let settledWaitingProbe = status(state: "connected", remote: "unknown")
+        let server = try MockControlServer { req in
+            switch req.command {
+            case "wait":
+                return .failure("usage", "Unknown command 'wait'.")
+            case "status":
+                return ControlResponse(ok: true, tunnels: [settledWaitingProbe])
+            default:
+                return .failure("usage", "unknown")
+            }
+        }
+        defer { server.stop() }
+
+        let initial = ControlResponse(ok: true, tunnels: [status(state: "connecting", remote: "unknown", url: nil)])
+        let (result, timedOut) = try CLI.waitForConnections(initial, options: Options(timeout: 0.05), client: ControlClient(socketURL: server.socketURL))
+        XCTAssertFalse(timedOut, "a tunnel already in connected state must not report timeout at deadline")
+        XCTAssertEqual(result.tunnels.first?.state, "connected")
+    }
+
+    func testOpenConnectsIdleTunnelAndLaunchesURL() throws {
+        let current = Locked(status(state: "idle", remote: "unknown", url: nil))
+        let openedURLs = Locked([String]())
+        let server = try MockControlServer { req in
+            switch req.command {
+            case "ping": return .success()
+            case "status": return current.withValue { ControlResponse(ok: true, tunnels: [$0]) }
+            case "connect":
+                return current.withValue { state in
+                    state = self.status(state: "connecting", remote: "unknown", url: nil)
+                    return ControlResponse(ok: true, tunnels: [state])
+                }
+            case "wait":
+                return current.withValue { state in
+                    state = self.status(state: "connected", remote: "listening", url: "http://127.0.0.1:3000")
+                    return ControlResponse(ok: true, tunnels: [state])
+                }
+            default: return .failure("usage", "unknown")
+            }
+        }
+        defer { server.stop() }
+
+        let exit = CLI.run(
+            arguments: ["open", "web"],
+            client: ControlClient(socketURL: server.socketURL),
+            openURL: { url in
+                openedURLs.withValue { $0.append(url) }
+                return true
+            }
+        )
+        XCTAssertEqual(exit, ExitCode.ok)
+        XCTAssertEqual(openedURLs.withValue { $0 }, ["http://127.0.0.1:3000"])
+    }
+
+    func testOpenNoConnectAndTCPTunnelErrors() throws {
+        let opened = Locked(false)
+        let current = Locked(status(state: "idle", remote: "unknown", url: nil))
+        let server = try MockControlServer { req in
+            switch req.command {
+            case "ping": return .success()
+            case "status": return current.withValue { ControlResponse(ok: true, tunnels: [$0]) }
+            default: return .failure("usage", "unexpected \(req.command)")
+            }
+        }
+        defer { server.stop() }
+
+        let idleExit = CLI.run(
+            arguments: ["open", "web", "--no-connect"],
+            client: ControlClient(socketURL: server.socketURL),
+            openURL: { _ in opened.withValue { $0 = true }; return true }
+        )
+        XCTAssertEqual(idleExit, ExitCode.connectFailed)
+        XCTAssertFalse(opened.withValue { $0 })
+
+        current.withValue {
+            $0 = self.status(name: "db", scheme: "tcp", state: "connected", remote: "listening", url: nil)
+        }
+        let tcpExit = CLI.run(
+            arguments: ["open", "db"],
+            client: ControlClient(socketURL: server.socketURL),
+            openURL: { _ in opened.withValue { $0 = true }; return true }
+        )
+        XCTAssertEqual(tcpExit, ExitCode.usage)
+        XCTAssertFalse(opened.withValue { $0 })
+    }
+
+    func testRecheckHostsAndUpdateFailureThroughCLI() throws {
+        let recheckPolls = Locked(0)
+        let server = try MockControlServer { req in
+            switch req.command {
+            case "ping": return .success()
+            case "recheck":
+                return ControlResponse(ok: true, tunnels: [self.status(state: "connected", remote: "unknown")])
+            case "status":
+                let count = recheckPolls.withValue { $0 += 1; return $0 }
+                let remote = count >= 2 ? "listening" : "unknown"
+                return ControlResponse(ok: true, tunnels: [self.status(state: "connected", remote: remote)])
+            case "hosts":
+                return ControlResponse(ok: true, hosts: ["homelab", "prod"])
+            case "update":
+                return ControlResponse(ok: true, tunnels: [self.status(state: "failed", error: "Local port 3000 is already in use.", url: nil)])
+            case "wait":
+                return ControlResponse(ok: true, tunnels: [self.status(state: "failed", error: "Local port 3000 is already in use.", url: nil)])
+            default:
+                return .failure("usage", "unknown")
+            }
+        }
+        defer { server.stop() }
+        let client = ControlClient(socketURL: server.socketURL)
+
+        XCTAssertEqual(CLI.run(arguments: ["recheck", "web", "--json"], client: client), ExitCode.ok)
+        XCTAssertGreaterThanOrEqual(recheckPolls.withValue { $0 }, 2)
+        XCTAssertEqual(CLI.run(arguments: ["hosts"], client: client), ExitCode.ok)
+        XCTAssertEqual(CLI.run(arguments: ["update", "web", "--local-port", "3000"], client: client), ExitCode.connectFailed)
+    }
+
+    func testBundleVersionAndDoctorChecks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("lt-doc-\(UUID())")
+        let bundle = root.appendingPathComponent("LabTunnel.app")
+        let home = root.appendingPathComponent("home")
+        let fm = FileManager.default
+        try fm.createDirectory(at: bundle.appendingPathComponent("Contents/Helpers"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: bundle.appendingPathComponent("Contents/Resources/skill"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: home, withIntermediateDirectories: true)
+        addTeardownBlock { try? fm.removeItem(at: root) }
+
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.4.2</string></dict></plist>
+        """
+        try plist.write(to: bundle.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(CLI.bundleVersion(in: bundle), "1.4.2")
+        XCTAssertEqual(CLI.bundleVersion(in: nil), "0.1.0")
+
+        let helper = AgentSetup.helperURL(in: bundle)
+        try "#!/bin/sh\n".write(to: helper, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        try "skill".write(to: AgentSetup.skillSourceURL(in: bundle), atomically: true, encoding: .utf8)
+        _ = try AgentSetup.install(appBundle: bundle, home: home)
+
+        let fakeSSH = root.appendingPathComponent("ssh")
+        try "#!/bin/sh\n".write(to: fakeSSH, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSSH.path)
+
+        let server = try MockControlServer { req in
+            switch req.command {
+            case "ping": return .success()
+            case "list": return ControlResponse(ok: true, tunnels: [self.status()])
+            case "version": return ControlResponse(ok: true, version: "1.4.2")
+            default: return .failure("usage", "unknown")
+            }
+        }
+        defer { server.stop() }
+        let client = ControlClient(socketURL: server.socketURL)
+
+        let env = ["PATH": "\(home.appendingPathComponent(".local/bin").path):/usr/bin:/bin"]
+        let healthy = CLI.collectDoctorReport(
+            client: client, appBundle: bundle, home: home, environment: env,
+            sshPath: fakeSSH.path, sshAgentProbe: { .loaded(2) }
+        )
+        XCTAssertTrue(healthy.ok)
+        XCTAssertTrue(healthy.checks.allSatisfy { $0.level == .ok })
+        XCTAssertEqual(CLI.runVersion(json: false, client: client, appBundle: bundle), ExitCode.ok)
+
+        let missingSSHExit = CLI.runDoctor(
+            json: true, client: client, appBundle: bundle, home: home, environment: env,
+            sshPath: root.appendingPathComponent("missing-ssh").path, sshAgentProbe: { .noAgent }
+        )
+        XCTAssertEqual(missingSSHExit, ExitCode.failure)
+
+        let stoppedClient = ControlClient(socketURL: URL(fileURLWithPath: "/tmp/lt-none-\(UUID().uuidString.prefix(8)).sock"))
+        let warnOnly = CLI.collectDoctorReport(
+            client: stoppedClient, appBundle: bundle, home: home, environment: ["PATH": "/usr/bin"],
+            sshPath: fakeSSH.path, sshAgentProbe: { .noKeys }
+        )
+        XCTAssertTrue(warnOnly.ok, "non-running app and 0 ssh keys are warnings, not critical failures")
+        XCTAssertTrue(warnOnly.checks.contains { $0.name == "app" && $0.level == .warn })
+        XCTAssertTrue(warnOnly.checks.contains { $0.name == "path" && $0.level == .warn })
+        XCTAssertTrue(warnOnly.checks.contains { $0.name == "ssh" && $0.level == .warn })
     }
 }

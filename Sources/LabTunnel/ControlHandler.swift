@@ -14,37 +14,63 @@ struct ControlHandler {
 
     func handle(_ request: ControlRequest) -> ControlResponse {
         do {
-            return .success(try run(request))
-        } catch let failure as Failure {
-            return .failure(failure.code, failure.message)
+            return try run(request)
         } catch {
-            return .failure("internal", "\(error)")
+            return errorResponse(for: error)
         }
     }
 
-    private func run(_ request: ControlRequest) throws -> [TunnelStatus] {
+    func errorResponse(for error: Error) -> ControlResponse {
+        if let failure = error as? Failure {
+            return .failure(failure.code, failure.message)
+        }
+        return .failure("internal", "\(error)")
+    }
+
+    func resolvedIDs(for request: ControlRequest) throws -> [UUID] {
+        try selection(request, allowEmpty: false).map(\.id)
+    }
+
+    func statuses(for ids: [UUID]) -> [TunnelStatus] {
+        ids.compactMap { id in
+            manager.tunnels.first(where: { $0.id == id }).map(status)
+        }
+    }
+
+    private func run(_ request: ControlRequest) throws -> ControlResponse {
         switch request.command {
         case "ping":
-            return []
+            return .success([])
         case "list", "status":
-            return try selection(request, allowEmpty: true).map(status)
+            return .success(try selection(request, allowEmpty: true).map(status))
         case "add":
-            return [status(try add(request))]
+            return .success([status(try add(request))])
         case "update":
-            return [status(try update(request))]
+            return .success([status(try update(request))])
         case "remove":
             let targets = try selection(request, allowEmpty: false)
             let before = targets.map(status)
             targets.forEach(manager.delete)
-            return before
+            return .success(before)
         case "connect":
             let targets = try selection(request, allowEmpty: false)
             targets.forEach(manager.connect)
-            return targets.map(status)
+            return .success(targets.map(status))
         case "disconnect":
             let targets = try selection(request, allowEmpty: false)
             targets.forEach(manager.disconnect)
-            return targets.map(status)
+            return .success(targets.map(status))
+        case "recheck":
+            let targets = try selection(request, allowEmpty: false)
+            for tunnel in targets where manager.state(of: tunnel) == .connected {
+                manager.recheckRemote(tunnel)
+            }
+            return .success(targets.map(status))
+        case "hosts":
+            return ControlResponse(ok: true, hosts: SSHConfig.loadHostsCached())
+        case "version":
+            let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+            return ControlResponse(ok: true, version: version)
         default:
             throw Failure(code: "usage", message: "Unknown command '\(request.command)'.")
         }
@@ -59,14 +85,16 @@ struct ControlHandler {
         }
         // An empty local port means "same as remote", as in the editor.
         let localPort = fields.localPort ?? remotePort
-        try validate(name: name, host: host, remotePort: remotePort, localPort: localPort)
+        let remoteHost = fields.remoteHost?.trimmed ?? "127.0.0.1"
+        try validate(name: name, host: host, remoteHost: remoteHost, remotePort: remotePort, localPort: localPort)
         try ensureNameIsFree(name, except: nil)
 
         let tunnel = Tunnel(
             name: name.trimmed, host: host.trimmed, remotePort: remotePort, localPort: localPort,
             scheme: try scheme(fields.scheme) ?? .http, group: fields.group?.trimmed ?? "",
             connectOnLaunch: fields.connectOnLaunch ?? false,
-            useFreePortIfBusy: fields.useFreePortIfBusy ?? false
+            useFreePortIfBusy: fields.useFreePortIfBusy ?? false,
+            remoteHost: remoteHost
         )
         manager.save(tunnel)
         if request.connect { manager.connect(tunnel) }
@@ -85,6 +113,7 @@ struct ControlHandler {
         var updated = original
         if let name = fields.name { updated.name = name.trimmed }
         if let host = fields.host { updated.host = host.trimmed }
+        if let remoteHost = fields.remoteHost { updated.remoteHost = remoteHost.trimmed }
         if let port = fields.remotePort { updated.remotePort = port }
         if let port = fields.localPort { updated.localPort = port }
         if let value = try scheme(fields.scheme) { updated.scheme = value }
@@ -92,7 +121,13 @@ struct ControlHandler {
         if let value = fields.connectOnLaunch { updated.connectOnLaunch = value }
         if let value = fields.useFreePortIfBusy { updated.useFreePortIfBusy = value }
 
-        try validate(name: updated.name, host: updated.host, remotePort: updated.remotePort, localPort: updated.localPort)
+        try validate(
+            name: updated.name,
+            host: updated.host,
+            remoteHost: updated.remoteHost,
+            remotePort: updated.remotePort,
+            localPort: updated.localPort
+        )
         try ensureNameIsFree(updated.name, except: original.id)
 
         manager.save(updated)  // reconnects a live tunnel whose connection settings changed
@@ -138,8 +173,14 @@ struct ControlHandler {
         return Failure(code: "ambiguous", message: "'\(token)' matches several tunnels: \(ids). Use an id.")
     }
 
-    private func validate(name: String, host: String, remotePort: Int, localPort: Int) throws {
-        if let problem = Tunnel.validate(name: name, host: host, remotePort: remotePort, localPort: localPort) {
+    private func validate(name: String, host: String, remoteHost: String, remotePort: Int, localPort: Int) throws {
+        if let problem = Tunnel.validate(
+            name: name,
+            host: host,
+            remoteHost: remoteHost,
+            remotePort: remotePort,
+            localPort: localPort
+        ) {
             throw Failure(code: "invalid", message: problem)
         }
     }
@@ -190,7 +231,9 @@ struct ControlHandler {
             url: state == .connected ? tunnel.url(localPort: port)?.absoluteString : nil,
             remote: remote,
             traffic: TrafficStatus(up: traffic.up, down: traffic.down,
-                                   upRate: traffic.upRate, downRate: traffic.downRate)
+                                   upRate: traffic.upRate, downRate: traffic.downRate),
+            remoteHost: tunnel.remoteHost == "127.0.0.1" ? nil : tunnel.remoteHost,
+            uptimeSeconds: manager.uptimeSeconds(of: tunnel)
         )
     }
 }

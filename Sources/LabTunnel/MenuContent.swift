@@ -4,11 +4,41 @@ import SwiftUI
 
 struct MenuContent: View {
     let manager: TunnelManager
-    /// Reports when the editor opens or closes, so the host knows who owns the Esc key.
+    let popoverModel: PopoverModel
+    /// Reports when the editor or an active search owns the Esc key.
     var onEditingChange: (Bool) -> Void = { _ in }
     /// nil = showing the list; non-nil = showing the editor for that tunnel.
     @State private var editing: Tunnel?
     @State private var launchAtLogin = LoginItem.isEnabled
+    @State private var setupStatus = AgentSetup.status(appBundle: Bundle.main.bundleURL)
+    @State private var searchQuery = ""
+    @State private var showSearchBar = false
+    @FocusState private var isSearchFocused: Bool
+
+    private var activeCount: Int {
+        manager.tunnels.filter { manager.state(of: $0).isActive }.count
+    }
+
+    private var reconnectingCount: Int {
+        manager.tunnels.filter { manager.state(of: $0) == .reconnecting }.count
+    }
+
+    private var shouldShowSearch: Bool {
+        manager.tunnels.count >= 6 || showSearchBar
+    }
+
+    private var isSearching: Bool {
+        !searchQuery.isEmpty || (showSearchBar && manager.tunnels.count < 6)
+    }
+
+    private var filteredSections: [TunnelSection] {
+        let query = searchQuery.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return manager.sections }
+        return manager.sections.compactMap { section in
+            let matched = section.tunnels.filter { matchesSearch($0, query: query) }
+            return matched.isEmpty ? nil : TunnelSection(name: section.name, tunnels: matched)
+        }
+    }
 
     var body: some View {
         Group {
@@ -26,29 +56,66 @@ struct MenuContent: View {
                 list
             }
         }
-        .frame(width: 320)
-        .onChange(of: editing != nil) { _, isEditing in onEditingChange(isEditing) }
+        .frame(width: 350)
+        .onAppear(perform: refreshSystemStatus)
+        .onChange(of: popoverModel.openCount) { _, _ in refreshSystemStatus() }
+        .onChange(of: editing != nil || isSearching) { _, active in onEditingChange(active) }
     }
 
     private var list: some View {
         VStack(spacing: 0) {
             header
             Divider()
+            if shouldShowSearch {
+                searchBar
+                Divider()
+            }
             if manager.tunnels.isEmpty {
                 Text("No tunnels yet.\nAdd a host and port to get started.")
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 28)
+            } else if filteredSections.isEmpty {
+                VStack(spacing: 6) {
+                    Text("No matching tunnels.")
+                        .foregroundStyle(.secondary)
+                    Button("Clear Search") {
+                        searchQuery = ""
+                        showSearchBar = false
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
             } else {
                 ScrollView {
                     VStack(spacing: 0) {
-                        ForEach(manager.sections) { section in
+                        ForEach(filteredSections) { section in
                             if !section.name.isEmpty {
                                 GroupHeader(manager: manager, section: section)
                             }
                             ForEach(section.tunnels) { tunnel in
-                                TunnelRow(manager: manager, tunnel: tunnel, onEdit: { editing = tunnel })
+                                TunnelRow(
+                                    manager: manager,
+                                    tunnel: tunnel,
+                                    onEdit: { editing = tunnel },
+                                    onDuplicate: {
+                                        editing = Tunnel(
+                                            id: UUID(),
+                                            name: "",
+                                            host: tunnel.host,
+                                            remotePort: 0,
+                                            localPort: 0,
+                                            scheme: tunnel.scheme,
+                                            group: tunnel.group,
+                                            connectOnLaunch: tunnel.connectOnLaunch,
+                                            useFreePortIfBusy: tunnel.useFreePortIfBusy,
+                                            remoteHost: tunnel.remoteHost
+                                        )
+                                    }
+                                )
                             }
                         }
                     }
@@ -60,12 +127,81 @@ struct MenuContent: View {
             Divider()
             footer
         }
+        .background {
+            Button("") {
+                showSearchBar = true
+                isSearchFocused = true
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .accessibilityHidden(true)
+
+            if isSearching {
+                Button("") {
+                    searchQuery = ""
+                    showSearchBar = false
+                    isSearchFocused = false
+                }
+                .keyboardShortcut(.cancelAction)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private var searchBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+            TextField("Filter tunnels…", text: $searchQuery)
+                .textFieldStyle(.plain)
+                .font(.subheadline)
+                .focused($isSearchFocused)
+            if !searchQuery.isEmpty {
+                Button {
+                    searchQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
     }
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 6) {
             Text("LabTunnel").font(.headline)
+            if reconnectingCount > 0 {
+                Text("\(reconnectingCount) reconnecting")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.12), in: Capsule())
+            }
             Spacer()
+            if activeCount >= 2 {
+                Button("Disconnect all") {
+                    manager.disconnectAll()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+            } else if manager.tunnels.count >= 2 && activeCount == 0 {
+                Button("Connect all") {
+                    connectAll()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+            }
             Text(manager.connectedCount == 0 ? "None connected" : "\(manager.connectedCount) connected")
                 .font(.caption)
                 .foregroundStyle(manager.connectedCount == 0 ? Color.secondary : Color.green)
@@ -81,16 +217,47 @@ struct MenuContent: View {
             } label: {
                 Label("Add Tunnel", systemImage: "plus")
             }
+            .keyboardShortcut("n")
             Spacer()
             Menu {
                 Toggle("Launch at Login", isOn: Binding(
                     get: { launchAtLogin },
                     set: { enabled in
-                        do { try LoginItem.setEnabled(enabled) } catch { NSLog("LabTunnel: login item: \(error)") }
+                        do {
+                            try LoginItem.setEnabled(enabled)
+                            if enabled && LoginItem.status == .requiresApproval {
+                                showLoginItemGuidance(nil)
+                            }
+                        } catch {
+                            NSLog("LabTunnel: login item: \(error)")
+                            showLoginItemGuidance(error)
+                        }
                         launchAtLogin = LoginItem.isEnabled
                     }
                 ))
-                Button("Set Up CLI & Agent Skill…", action: setUpAgentTools)
+                if !manager.tunnels.isEmpty {
+                    Divider()
+                    Button("Connect All") { connectAll() }
+                        .disabled(activeCount == manager.tunnels.count)
+                    Button("Disconnect All") { manager.disconnectAll() }
+                        .disabled(activeCount == 0)
+                }
+                Divider()
+                Button {
+                    setUpAgentTools()
+                    refreshSystemStatus()
+                } label: {
+                    if setupStatus.isComplete {
+                        Label("CLI & Agent Skill", systemImage: "checkmark")
+                    } else if setupStatus.cliInstalled || setupStatus.skillInstalled {
+                        Text("Update CLI & Agent Skill…")
+                    } else {
+                        Text("Set Up CLI & Agent Skill…")
+                    }
+                }
+                Button("Open Config Folder") {
+                    NSWorkspace.shared.open(ControlPaths.defaultDirectoryURL)
+                }
             } label: {
                 Image(systemName: "gearshape")
             }
@@ -104,6 +271,37 @@ struct MenuContent: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
+
+    private func refreshSystemStatus() {
+        launchAtLogin = LoginItem.isEnabled
+        setupStatus = AgentSetup.status(appBundle: Bundle.main.bundleURL)
+    }
+
+    private func connectAll() {
+        for tunnel in manager.tunnels where !manager.state(of: tunnel).isActive {
+            manager.connect(tunnel)
+        }
+    }
+
+    private func matchesSearch(_ tunnel: Tunnel, query: String) -> Bool {
+        if tunnel.name.localizedCaseInsensitiveContains(query) { return true }
+        if tunnel.host.localizedCaseInsensitiveContains(query) { return true }
+        if tunnel.remoteHost.localizedCaseInsensitiveContains(query) { return true }
+        if tunnel.group.localizedCaseInsensitiveContains(query) { return true }
+        if String(tunnel.localPort).localizedCaseInsensitiveContains(query) { return true }
+        if String(tunnel.remotePort).localizedCaseInsensitiveContains(query) { return true }
+        let activePort = manager.localPort(of: tunnel)
+        return activePort != tunnel.localPort && String(activePort).localizedCaseInsensitiveContains(query)
+    }
+}
+
+@MainActor
+private func showLoginItemGuidance(_ error: Error?) {
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "Launch at Login"
+    alert.informativeText = LoginItem.guidance(for: error)
+    alert.runModal()
 }
 
 /// Links the `labtunnel` command into ~/.local/bin and installs the agent skill.
@@ -154,28 +352,66 @@ private struct TunnelRow: View {
     let manager: TunnelManager
     let tunnel: Tunnel
     let onEdit: () -> Void
+    let onDuplicate: () -> Void
+
+    @State private var copied = false
+    @State private var copiedTask: Task<Void, Never>?
 
     var body: some View {
         let state = manager.state(of: tunnel)
         let remote = manager.remoteStatus(of: tunnel)
         let port = manager.localPort(of: tunnel)
         VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Circle()
                     .fill(color(for: state, remote: remote))
                     .frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(tunnel.name).fontWeight(.medium)
-                    Text(verbatim: tunnel.route(localPort: port))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(verbatim: tunnel.route(localPort: port))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if state.isActive && port != tunnel.localPort {
+                            Text(verbatim: "preferred \(tunnel.localPort)")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Color.orange.opacity(0.12), in: Capsule())
+                        }
+                    }
                     if state == .connected, let traffic = manager.traffic[tunnel.id] {
                         Text(TrafficFormat.summary(traffic))
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                 }
-                Spacer()
+                Spacer(minLength: 4)
+                if copied {
+                    Text("Copied")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.green)
+                }
+                if state == .connected {
+                    if let url = tunnel.url(localPort: port) {
+                        Button {
+                            NSWorkspace.shared.open(url)
+                        } label: {
+                            Image(systemName: "arrow.up.right.square")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Open in Browser")
+                    } else {
+                        Button {
+                            copy("127.0.0.1:\(port)")
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy Address")
+                    }
+                }
                 Menu {
                     if let url = tunnel.url(localPort: port) {
                         Button("Open in Browser") { NSWorkspace.shared.open(url) }
@@ -186,7 +422,11 @@ private struct TunnelRow: View {
                     }
                     Button("Re-check Remote") { manager.recheckRemote(tunnel) }
                         .disabled(state != .connected)
+                    if case .failed(let message) = state {
+                        Button("Copy Error") { copy(message) }
+                    }
                     Divider()
+                    Button("Duplicate…", action: onDuplicate)
                     Button("Edit…", action: onEdit)
                     Button("Delete", role: .destructive) { manager.delete(tunnel) }
                 } label: {
@@ -213,12 +453,23 @@ private struct TunnelRow: View {
     private func note(for state: TunnelState, remote: RemoteStatus) -> some View {
         switch (state, remote) {
         case (.failed(let message), _):
-            Text(message).font(.caption).foregroundStyle(.red).lineLimit(2).padding(.leading, 18)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .lineLimit(2)
+                .help(message)
+                .padding(.leading, 16)
         case (.reconnecting, _):
-            Text("Connection lost. Reconnecting…").font(.caption).foregroundStyle(.orange).padding(.leading, 18)
+            Text("Connection lost. Reconnecting…")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .padding(.leading, 16)
         case (.connected, .notListening):
             Text(verbatim: "Connected, but nothing is listening on remote port \(tunnel.remotePort).")
-                .font(.caption).foregroundStyle(.orange).lineLimit(2).padding(.leading, 18)
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .lineLimit(2)
+                .padding(.leading, 16)
         default:
             EmptyView()
         }
@@ -236,6 +487,13 @@ private struct TunnelRow: View {
     private func copy(_ string: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(string, forType: .string)
+        copied = true
+        copiedTask?.cancel()
+        copiedTask = Task {
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard !Task.isCancelled else { return }
+            copied = false
+        }
     }
 }
 
@@ -246,18 +504,20 @@ private struct TunnelEditor: View {
     let onCancel: () -> Void
     let isNameTaken: (String) -> Bool
 
-    /// Hosts already used by entries plus aliases from ~/.ssh/config.
-    private let allHosts: [String]
+    private let knownHosts: [String]
     private let knownGroups: [String]
 
+    @State private var sshHosts: [String] = []
     @State private var name: String
     @State private var group: String
     @State private var host: String
+    @State private var remoteHost: String
     @State private var remotePort: String
     @State private var localPort: String
     @State private var scheme: Scheme
     @State private var useFreePortIfBusy: Bool
     @State private var connectOnLaunch: Bool
+    @State private var advancedExpanded: Bool
     @State private var error: String?
 
     init(tunnel: Tunnel, isNew: Bool, knownHosts: [String], knownGroups: [String],
@@ -268,17 +528,25 @@ private struct TunnelEditor: View {
         self.onSave = onSave
         self.onCancel = onCancel
         self.isNameTaken = isNameTaken
+        self.knownHosts = knownHosts
         self.knownGroups = knownGroups
-        allHosts = Array(Set(knownHosts + SSHConfig.loadHosts()))
-            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        let hasCustomRemoteHost = tunnel.remoteHost != "127.0.0.1"
         _name = State(initialValue: tunnel.name)
         _group = State(initialValue: tunnel.group)
         _host = State(initialValue: tunnel.host)
+        _remoteHost = State(initialValue: hasCustomRemoteHost ? tunnel.remoteHost : "")
         _remotePort = State(initialValue: isNew ? "" : String(tunnel.remotePort))
         _localPort = State(initialValue: isNew ? "" : String(tunnel.localPort))
         _scheme = State(initialValue: tunnel.scheme)
         _useFreePortIfBusy = State(initialValue: tunnel.useFreePortIfBusy)
         _connectOnLaunch = State(initialValue: tunnel.connectOnLaunch)
+        _advancedExpanded = State(initialValue: hasCustomRemoteHost)
+    }
+
+    /// Hosts already used by entries plus aliases loaded asynchronously from ~/.ssh/config.
+    private var allHosts: [String] {
+        Array(Set(knownHosts + sshHosts))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
     /// Hosts containing what's typed so far, excluding an exact match.
@@ -334,6 +602,13 @@ private struct TunnelEditor: View {
             Toggle("Use a free port if the local port is busy", isOn: $useFreePortIfBusy)
             Toggle("Connect when LabTunnel starts", isOn: $connectOnLaunch)
 
+            DisclosureGroup("Advanced", isExpanded: $advancedExpanded) {
+                field("Remote bind") {
+                    TextField("127.0.0.1", text: $remoteHost)
+                }
+                .padding(.top, 4)
+            }
+
             if let error {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
@@ -347,6 +622,9 @@ private struct TunnelEditor: View {
         .textFieldStyle(.roundedBorder)
         .toggleStyle(.checkbox)
         .padding(12)
+        .task {
+            sshHosts = await Task.detached { SSHConfig.loadHostsCached() }.value
+        }
     }
 
     @ViewBuilder
@@ -377,7 +655,15 @@ private struct TunnelEditor: View {
         // An empty local port means "same as remote", which keeps OAuth-style redirects working.
         let local = localPort.trimmingCharacters(in: .whitespaces).isEmpty
             ? remote : Int(localPort.trimmingCharacters(in: .whitespaces))
-        if let problem = Tunnel.validate(name: name, host: host, remotePort: remote, localPort: local) {
+        let trimmedRemoteHost = remoteHost.trimmingCharacters(in: .whitespaces)
+        let effectiveRemoteHost = trimmedRemoteHost.isEmpty ? "127.0.0.1" : trimmedRemoteHost
+        if let problem = Tunnel.validate(
+            name: name,
+            host: host,
+            remoteHost: effectiveRemoteHost,
+            remotePort: remote,
+            localPort: local
+        ) {
             error = problem
             return
         }
@@ -390,6 +676,7 @@ private struct TunnelEditor: View {
         updated.name = trimmedName
         updated.group = group.trimmingCharacters(in: .whitespaces)
         updated.host = host.trimmingCharacters(in: .whitespaces)
+        updated.remoteHost = effectiveRemoteHost
         updated.remotePort = remote!
         updated.localPort = local!
         updated.scheme = scheme

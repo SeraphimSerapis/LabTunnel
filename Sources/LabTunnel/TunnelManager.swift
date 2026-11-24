@@ -1,34 +1,60 @@
 import AppKit
+import Darwin
+import Network
 import Observation
 
 /// Owns the saved tunnels and the `ssh` processes behind them.
 @MainActor
 @Observable
 final class TunnelManager {
-    private(set) var tunnels: [Tunnel] = []
-    private(set) var states: [UUID: TunnelState] = [:]
+    private(set) var tunnels: [Tunnel] = [] {
+        didSet { notifyWaiters() }
+    }
+    private(set) var states: [UUID: TunnelState] = [:] {
+        didSet { notifyWaiters() }
+    }
     /// The port each active tunnel really listens on. Differs from `Tunnel.localPort`
     /// when the preferred port was busy and the entry allows a fallback.
     private(set) var localPorts: [UUID: Int] = [:]
-    private(set) var remoteStatus: [UUID: RemoteStatus] = [:]
+    private(set) var remoteStatus: [UUID: RemoteStatus] = [:] {
+        didSet { notifyWaiters() }
+    }
     private(set) var traffic: [UUID: Traffic] = [:]
+    private(set) var connectedSince: [UUID: Date] = [:]
 
     @ObservationIgnored private var processes: [UUID: Process] = [:]
-    @ObservationIgnored private var watchdogs: [UUID: Watchdog] = [:]
-    @ObservationIgnored private var monitors: [UUID: TrafficMonitor] = [:]
+    @ObservationIgnored private var outputTails: [UUID: OutputTail] = [:]
+    @ObservationIgnored private var waitTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var watchdog: Watchdog?
+    @ObservationIgnored private var trackedWatchdogPIDs: Set<Int32> = []
+    @ObservationIgnored private var trafficMonitor: TrafficMonitor?
+    @ObservationIgnored private var trafficMonitorID: UUID?
+    @ObservationIgnored private var pidToTunnel: [Int32: UUID] = [:]
+    @ObservationIgnored private var monitorRestartTask: Task<Void, Never>?
     @ObservationIgnored private var counters: [UUID: TrafficCounter] = [:]
     /// Tunnels in auto-reconnect mode: they were up once, so failures are retried, not reported.
     @ObservationIgnored private var retrying: Set<UUID> = []
     @ObservationIgnored private var attempts: [UUID: Int] = [:]
     @ObservationIgnored private var retryTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var waiters: [UUID: @MainActor @Sendable () -> Void] = [:]
     @ObservationIgnored private let storeURL: URL
     @ObservationIgnored private let sshExecutable: URL
     @ObservationIgnored private let pidRegistry: PIDRegistry
-    @ObservationIgnored private var wakeObserver: NSObjectProtocol?
+    @ObservationIgnored private let probeQueue = DispatchQueue(
+        label: "dev.messerschmidt.labtunnel.probe",
+        attributes: .concurrent
+    )
+    @ObservationIgnored private let networkQueue = DispatchQueue(label: "dev.messerschmidt.labtunnel.network")
+    @ObservationIgnored private nonisolated(unsafe) var wakeObserver: NSObjectProtocol?
+    @ObservationIgnored private nonisolated(unsafe) var pathMonitor: NWPathMonitor?
+    @ObservationIgnored private nonisolated(unsafe) var pathDebounceWork: DispatchWorkItem?
+    @ObservationIgnored private var lastPathStatus: NWPath.Status?
+    @ObservationIgnored private var lastInterfaceType: NWInterface.InterfaceType?
 
     /// `sshExecutable` exists for tests, which substitute a stand-in that never connects.
     init(storeURL: URL = TunnelManager.defaultStoreURL,
-         sshExecutable: URL = URL(fileURLWithPath: "/usr/bin/ssh")) {
+         sshExecutable: URL = URL(fileURLWithPath: "/usr/bin/ssh"),
+         monitorNetwork: Bool? = nil) {
         self.storeURL = storeURL
         self.sshExecutable = sshExecutable
         pidRegistry = PIDRegistry(url: storeURL.deletingLastPathComponent().appendingPathComponent("ssh-pids.json"))
@@ -39,6 +65,31 @@ final class TunnelManager {
         ) { [weak self] _ in
             Task { @MainActor in self?.restartAfterWake() }
         }
+        let shouldMonitorNetwork = monitorNetwork ?? (sshExecutable.path == "/usr/bin/ssh")
+        if shouldMonitorNetwork {
+            let monitor = NWPathMonitor()
+            monitor.pathUpdateHandler = { [weak self] path in
+                guard let self else { return }
+                self.pathDebounceWork?.cancel()
+                let item = DispatchWorkItem { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.handleNetworkPathChange(path)
+                    }
+                }
+                self.pathDebounceWork = item
+                self.networkQueue.asyncAfter(deadline: .now() + .milliseconds(500), execute: item)
+            }
+            monitor.start(queue: networkQueue)
+            pathMonitor = monitor
+        }
+    }
+
+    deinit {
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+        pathDebounceWork?.cancel()
+        pathMonitor?.cancel()
     }
 
     nonisolated static var defaultStoreURL: URL {
@@ -48,10 +99,25 @@ final class TunnelManager {
     }
 
     var connectedCount: Int { tunnels.filter { state(of: $0) == .connected }.count }
+    var activeCount: Int { tunnels.filter { state(of: $0).isActive }.count }
+    var reconnectingCount: Int { tunnels.filter { state(of: $0) == .reconnecting }.count }
+    var failedCount: Int {
+        tunnels.filter {
+            if case .failed = state(of: $0) { return true }
+            return false
+        }.count
+    }
     var knownHosts: [String] { Array(Set(tunnels.map(\.host))).sorted() }
+
     var knownGroups: [String] {
-        Array(Set(tunnels.map(\.group).filter { !$0.isEmpty }))
-            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        var firstCasing: [String: String] = [:]
+        for tunnel in tunnels where !tunnel.group.isEmpty {
+            let key = tunnel.group.lowercased()
+            if firstCasing[key] == nil {
+                firstCasing[key] = tunnel.group
+            }
+        }
+        return firstCasing.values.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
     /// Ungrouped entries first, then one section per group in alphabetical order.
@@ -59,8 +125,12 @@ final class TunnelManager {
         var result: [TunnelSection] = []
         let ungrouped = tunnels.filter { $0.group.isEmpty }
         if !ungrouped.isEmpty { result.append(TunnelSection(name: "", tunnels: ungrouped)) }
+        var grouped: [String: [Tunnel]] = [:]
+        for tunnel in tunnels where !tunnel.group.isEmpty {
+            grouped[tunnel.group.lowercased(), default: []].append(tunnel)
+        }
         for group in knownGroups {
-            result.append(TunnelSection(name: group, tunnels: tunnels.filter { $0.group == group }))
+            result.append(TunnelSection(name: group, tunnels: grouped[group.lowercased()] ?? []))
         }
         return result
     }
@@ -68,6 +138,11 @@ final class TunnelManager {
     func state(of tunnel: Tunnel) -> TunnelState { states[tunnel.id] ?? .idle }
     func localPort(of tunnel: Tunnel) -> Int { localPorts[tunnel.id] ?? tunnel.localPort }
     func remoteStatus(of tunnel: Tunnel) -> RemoteStatus { remoteStatus[tunnel.id] ?? .unknown }
+
+    func uptimeSeconds(of tunnel: Tunnel) -> Int? {
+        guard state(of: tunnel) == .connected, let since = connectedSince[tunnel.id] else { return nil }
+        return max(0, Int(Date().timeIntervalSince(since)))
+    }
 
     // MARK: Editing
 
@@ -98,6 +173,7 @@ final class TunnelManager {
         disconnect(tunnel)
         tunnels.removeAll { $0.id == tunnel.id }
         states[tunnel.id] = nil
+        connectedSince[tunnel.id] = nil
         persist()
     }
 
@@ -109,7 +185,7 @@ final class TunnelManager {
 
     /// Switches every entry in `group` on or off.
     func setGroup(_ group: String, connected: Bool) {
-        for tunnel in tunnels where tunnel.group == group {
+        for tunnel in tunnels where tunnel.group.caseInsensitiveCompare(group) == .orderedSame {
             let active = state(of: tunnel).isActive
             if connected && !active { connect(tunnel) }
             if !connected && active { disconnect(tunnel) }
@@ -118,6 +194,12 @@ final class TunnelManager {
 
     func connectOnLaunchTunnels() {
         tunnels.filter(\.connectOnLaunch).forEach(connect)
+    }
+
+    func connectAll() {
+        for tunnel in tunnels where !state(of: tunnel).isActive {
+            connect(tunnel)
+        }
     }
 
     /// User-initiated connect. Starts a fresh attempt: failures are reported, not retried,
@@ -133,44 +215,70 @@ final class TunnelManager {
     func disconnect(_ tunnel: Tunnel) {
         let id = tunnel.id
         cancelRetry(id)
-        watchdogs.removeValue(forKey: id)?.stop()
+        waitTasks.removeValue(forKey: id)?.cancel()
+        // Close stderr tail before terminating so intentional disconnects do not wait 2s on stderr.
+        outputTails.removeValue(forKey: id)?.close()
         // Drop the process first so its termination handler knows this was deliberate.
         if let process = processes.removeValue(forKey: id) {
-            pidRegistry.remove(process.processIdentifier)
+            let pid = process.processIdentifier
+            pidRegistry.remove(pid)
+            untrackWatchdog(pid: pid)
             process.terminate()
         }
-        stopMonitor(id)
+        stopTrafficMonitoring(id: id)
         counters[id] = nil
         traffic[id] = nil
         states[id] = .idle
         localPorts[id] = nil
         remoteStatus[id] = nil
+        connectedSince[id] = nil
     }
 
     /// Called on app quit. Waits briefly so the local ports are free again afterwards.
     func disconnectAll() {
+        waitTasks.values.forEach { $0.cancel() }
+        waitTasks.removeAll()
         retryTasks.values.forEach { $0.cancel() }
         retryTasks.removeAll()
         retrying.removeAll()
         attempts.removeAll()
-        // Stop the watchdogs first. Once our process exits they would otherwise fire at PIDs
+        monitorRestartTask?.cancel()
+        monitorRestartTask = nil
+
+        trafficMonitor?.stop()
+        trafficMonitor = nil
+        trafficMonitorID = nil
+        pidToTunnel.removeAll()
+
+        // Stop the watchdog first. Once our process exits it would otherwise fire at PIDs
         // that already belong to nothing, or to something else.
-        let dogs = Array(watchdogs.values)
-        watchdogs.removeAll()
-        dogs.forEach { $0.stop() }
-        dogs.forEach { $0.waitUntilExit() }
+        trackedWatchdogPIDs.removeAll()
+        watchdog?.stop()
+        watchdog = nil
+
+        outputTails.values.forEach { $0.close() }
+        outputTails.removeAll()
+
         let running = Array(processes.values)
         processes.removeAll()
-        running.forEach { $0.terminate() }
-        running.forEach { $0.waitUntilExit() }
+        running.forEach {
+            if $0.isRunning { $0.terminate() }
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while running.contains(where: \.isRunning) && Date() < deadline {
+            usleep(20_000)
+        }
+        for process in running where process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+
         pidRegistry.clear()
-        monitors.values.forEach { $0.stop() }
-        monitors.removeAll()
         counters.removeAll()
         traffic.removeAll()
         for id in states.keys { states[id] = .idle }
         localPorts.removeAll()
         remoteStatus.removeAll()
+        connectedSince.removeAll()
     }
 
     /// Re-runs the "is anything listening on the remote side" check for a connected tunnel.
@@ -178,15 +286,102 @@ final class TunnelManager {
         let id = tunnel.id
         guard states[id] == .connected, let port = localPorts[id], let process = processes[id] else { return }
         remoteStatus[id] = .unknown
-        Task {
-            let result = await Task.detached { probeRemoteListening(localPort: port) }.value
-            guard processes[id] === process, states[id] == .connected else { return }
+        let queue = probeQueue
+        Task { [weak self] in
+            let result = await withCheckedContinuation { continuation in
+                queue.async {
+                    continuation.resume(returning: probeRemoteListening(localPort: port))
+                }
+            }
+            guard let self, self.processes[id] === process, self.states[id] == .connected else { return }
             switch result {
-            case true?: remoteStatus[id] = .listening
-            case false?: remoteStatus[id] = .notListening
-            case nil: remoteStatus[id] = .unknown
+            case true?: self.remoteStatus[id] = .listening
+            case false?: self.remoteStatus[id] = .notListening
+            case nil: self.remoteStatus[id] = .unknown
             }
         }
+    }
+
+    /// Waits until every tunnel in `ids` settles into connected, failed, or idle (or is removed),
+    /// and any connected tunnel finishes its initial remote check (up to 4s after settling).
+    /// Returns `true` only if `timeout` expires while a tunnel is still connecting or reconnecting.
+    func waitForSettlement(ids: [UUID], timeout: TimeInterval) async -> Bool {
+        let clock = ContinuousClock()
+        let overallDeadline = clock.now + .seconds(max(0, timeout))
+        var settledAt: ContinuousClock.Instant?
+
+        while true {
+            let (settled, remoteDone) = settlementStatus(for: ids)
+            if settled {
+                if remoteDone { return false }
+                if settledAt == nil { settledAt = clock.now }
+                if let settledAt, clock.now >= settledAt + .seconds(4) { return false }
+            } else {
+                settledAt = nil
+            }
+
+            if clock.now >= overallDeadline || Task.isCancelled {
+                return !settled
+            }
+
+            let nextDeadline = settledAt.map { min(overallDeadline, $0 + .seconds(4)) } ?? overallDeadline
+            await waitForStateChange(until: nextDeadline, clock: clock)
+        }
+    }
+
+    private func settlementStatus(for ids: [UUID]) -> (settled: Bool, remoteDone: Bool) {
+        var allSettled = true
+        var allRemoteDone = true
+        for id in ids {
+            guard tunnels.contains(where: { $0.id == id }) else { continue }
+            let currentState = states[id] ?? .idle
+            switch currentState {
+            case .connected:
+                if (remoteStatus[id] ?? .unknown) == .unknown {
+                    allRemoteDone = false
+                }
+            case .idle, .failed:
+                break
+            case .connecting, .reconnecting:
+                allSettled = false
+            }
+        }
+        return (allSettled, allRemoteDone)
+    }
+
+    private func waitForStateChange(until deadline: ContinuousClock.Instant, clock: ContinuousClock) async {
+        let waiterID = UUID()
+        let box = WaiterBox()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                waiters[waiterID] = { [weak self] in
+                    self?.waiters.removeValue(forKey: waiterID)
+                    box.wake()
+                }
+                let sleepTask = Task { @MainActor [weak self] in
+                    try? await clock.sleep(until: deadline, tolerance: nil)
+                    self?.waiters.removeValue(forKey: waiterID)
+                    box.wake()
+                }
+                if !box.arm(continuation: continuation, sleepTask: sleepTask) {
+                    waiters.removeValue(forKey: waiterID)
+                    sleepTask.cancel()
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            box.wake()
+            Task { @MainActor [weak self] in
+                self?.waiters.removeValue(forKey: waiterID)
+            }
+        }
+    }
+
+    private func notifyWaiters() {
+        guard !waiters.isEmpty else { return }
+        let current = Array(waiters.values)
+        waiters.removeAll()
+        current.forEach { $0() }
     }
 
     // MARK: Process lifecycle
@@ -200,11 +395,22 @@ final class TunnelManager {
         }
 
         let process = Process()
+        let stderr = OutputTail { [weak self, weak process] line in
+            guard line.contains("open failed: connect failed:") else { return }
+            Task { @MainActor in
+                guard let self,
+                      let process,
+                      self.processes[id] === process,
+                      self.states[id] == .connected else { return }
+                if self.remoteStatus[id] != .notListening {
+                    self.remoteStatus[id] = .notListening
+                }
+            }
+        }
         process.executableURL = sshExecutable
         process.arguments = tunnel.sshArguments(localPort: port)
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
-        let stderr = OutputTail()
         process.standardError = stderr.pipe
         process.terminationHandler = { [weak self] proc in
             let output = stderr.text()
@@ -214,50 +420,154 @@ final class TunnelManager {
         do {
             try process.run()
         } catch {
+            stderr.close()
             fail(tunnel, error.localizedDescription)
             return
         }
-        pidRegistry.add(process.processIdentifier)
-        startMonitor(id: id, pid: process.processIdentifier)
-        startWatchdog(id: id, pids: [process.processIdentifier] + (monitors[id].map { [$0.processIdentifier] } ?? []))
+        let pid = process.processIdentifier
+        pidRegistry.add(pid)
+        trackWatchdog(pid: pid)
+        outputTails[id] = stderr
         processes[id] = process
         localPorts[id] = port
-        states[id] = .connecting
+        states[id] = retrying.contains(id) ? .reconnecting : .connecting
         remoteStatus[id] = nil
-        Task { await waitUntilListening(tunnel, port: port, process: process) }
-    }
+        connectedSince[id] = nil
 
-    private func startMonitor(id: UUID, pid: Int32) {
-        stopMonitor(id)
-        let generation = UUID()
-        let monitor = TrafficMonitor(pid: pid, generation: generation) { [weak self] up, down in
-            Task { @MainActor in self?.recordTraffic(id: id, generation: generation, up: up, down: down) }
+        waitTasks[id]?.cancel()
+        waitTasks[id] = Task { [weak self] in
+            await self?.waitUntilListening(tunnel, port: port, process: process)
         }
-        guard let monitor else { return }  // traffic stats are optional; the tunnel still works
-        monitors[id] = monitor
-        counters[id, default: TrafficCounter()].sample(up: 0, down: 0)
     }
 
-    private func stopMonitor(_ id: UUID) {
-        monitors.removeValue(forKey: id)?.stop()
+    // MARK: Shared watchdog and traffic monitor
+
+    private func trackWatchdog(pid: Int32) {
+        guard pid > 0 else { return }
+        trackedWatchdogPIDs.insert(pid)
+        if watchdog == nil || watchdog?.isRunning == false {
+            watchdog?.stop()
+            do {
+                let wd = try Watchdog()
+                watchdog = wd
+                for activePID in trackedWatchdogPIDs {
+                    wd.track(activePID)
+                }
+            } catch {
+                watchdog = nil
+                NSLog("LabTunnel: could not start watchdog: \(error)")
+            }
+        } else {
+            watchdog?.track(pid)
+        }
+    }
+
+    private func untrackWatchdog(pid: Int32) {
+        guard pid > 0, trackedWatchdogPIDs.remove(pid) != nil else { return }
+        watchdog?.untrack(pid)
+        if trackedWatchdogPIDs.isEmpty {
+            watchdog?.stop()
+            watchdog = nil
+        }
+    }
+
+    private func startTrafficMonitoring(id: UUID, pid: Int32) {
+        monitorRestartTask?.cancel()
+        monitorRestartTask = nil
+        pidToTunnel[pid] = id
+        var counter = counters[id] ?? TrafficCounter()
+        counter.sample(up: 0, down: 0, monotonicSeconds: ProcessInfo.processInfo.systemUptime)
+        counters[id] = counter
+        if traffic[id] != counter.current {
+            traffic[id] = counter.current
+        }
+        ensureTrafficMonitorRunning()
+        trafficMonitor?.track(pid: pid)
+    }
+
+    private func ensureTrafficMonitorRunning() {
+        guard !pidToTunnel.isEmpty, trafficMonitor == nil else { return }
+        let monitorID = UUID()
+        guard let monitor = TrafficMonitor(
+            onSamples: { [weak self] batch in
+                let now = ProcessInfo.processInfo.systemUptime
+                Task { @MainActor in
+                    self?.handleTrafficSamples(batch, monotonicSeconds: now)
+                }
+            },
+            onUnexpectedExit: { [weak self] in
+                Task { @MainActor in
+                    self?.handleTrafficMonitorExit(id: monitorID)
+                }
+            }
+        ) else { return }
+        trafficMonitor = monitor
+        trafficMonitorID = monitorID
+        trackWatchdog(pid: monitor.processIdentifier)
+        for pid in pidToTunnel.keys {
+            monitor.track(pid: pid)
+        }
+    }
+
+    private func stopTrafficMonitoring(id: UUID) {
+        let removedPIDs = pidToTunnel.compactMap { $0.value == id ? $0.key : nil }
+        for pid in removedPIDs {
+            pidToTunnel.removeValue(forKey: pid)
+            trafficMonitor?.untrack(pid: pid)
+        }
         counters[id]?.endSession()
-        if let counter = counters[id] { traffic[id] = counter.current }
+        if let next = counters[id]?.current, traffic[id] != next {
+            traffic[id] = next
+        }
+        if pidToTunnel.isEmpty {
+            monitorRestartTask?.cancel()
+            monitorRestartTask = nil
+            if let monitor = trafficMonitor {
+                trafficMonitor = nil
+                trafficMonitorID = nil
+                untrackWatchdog(pid: monitor.processIdentifier)
+                monitor.stop()
+            }
+        }
     }
 
-    private func recordTraffic(id: UUID, generation: UUID, up: Int, down: Int) {
-        // Ignore late samples from a monitor that has since been replaced or stopped.
-        guard monitors[id]?.generation == generation else { return }
-        counters[id, default: TrafficCounter()].sample(up: up, down: down)
-        traffic[id] = counters[id]?.current
+    private func handleTrafficSamples(_ batch: [Int32: (up: Int, down: Int)], monotonicSeconds: TimeInterval) {
+        guard trafficMonitor != nil else { return }
+        for (pid, sample) in batch {
+            guard let id = pidToTunnel[pid] else { continue }
+            let previousDown = counters[id]?.current.down ?? 0
+            var counter = counters[id] ?? TrafficCounter()
+            counter.sample(up: sample.up, down: sample.down, monotonicSeconds: monotonicSeconds)
+            counters[id] = counter
+            let next = counter.current
+            if traffic[id] != next {
+                traffic[id] = next
+            }
+            if remoteStatus[id] == .notListening && next.down > previousDown {
+                remoteStatus[id] = .listening
+            }
+        }
     }
 
-    /// Kills the tunnel's `ssh` and traffic monitor if LabTunnel dies without cleaning up.
-    private func startWatchdog(id: UUID, pids: [Int32]) {
-        watchdogs.removeValue(forKey: id)?.stop()
-        do {
-            watchdogs[id] = try Watchdog(killing: pids)
-        } catch {
-            NSLog("LabTunnel: could not start watchdog: \(error)")
+    private func handleTrafficMonitorExit(id exitedID: UUID) {
+        guard trafficMonitorID == exitedID, let exited = trafficMonitor else { return }
+        trafficMonitor = nil
+        trafficMonitorID = nil
+        untrackWatchdog(pid: exited.processIdentifier)
+        guard !pidToTunnel.isEmpty else { return }
+        for id in Set(pidToTunnel.values) {
+            counters[id]?.endSession()
+            if let next = counters[id]?.current, traffic[id] != next {
+                traffic[id] = next
+            }
+        }
+        monitorRestartTask?.cancel()
+        monitorRestartTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, let self else { return }
+            self.monitorRestartTask = nil
+            guard !self.pidToTunnel.isEmpty else { return }
+            self.ensureTrafficMonitorRunning()
         }
     }
 
@@ -271,19 +581,32 @@ final class TunnelManager {
     }
 
     private func waitUntilListening(_ tunnel: Tunnel, port: Int, process: Process) async {
-        // ConnectTimeout is 10s; allow a little more before giving up.
-        for _ in 0..<60 {
-            guard processes[tunnel.id] === process else { return }
-            if isLocalPortInUse(port) {
+        let pid = process.processIdentifier
+        let initialDelaysMs = [25, 50, 100, 150]
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(12)
+        var step = 0
+
+        while true {
+            guard !Task.isCancelled, processes[tunnel.id] === process else { return }
+            if isProcessListening(pid: pid, port: port) {
+                waitTasks[tunnel.id] = nil
                 states[tunnel.id] = .connected
+                connectedSince[tunnel.id] = Date()
                 retrying.remove(tunnel.id)
                 attempts[tunnel.id] = nil
+                startTrafficMonitoring(id: tunnel.id, pid: pid)
                 recheckRemote(tunnel)
                 return
             }
-            try? await Task.sleep(for: .milliseconds(200))
+            if clock.now >= deadline { break }
+            let delayMs = step < initialDelaysMs.count ? initialDelaysMs[step] : 200
+            step += 1
+            try? await Task.sleep(for: .milliseconds(delayMs))
         }
-        guard processes[tunnel.id] === process else { return }
+
+        guard !Task.isCancelled, processes[tunnel.id] === process else { return }
+        waitTasks[tunnel.id] = nil
         if retrying.contains(tunnel.id) {
             process.terminate()  // processExited schedules the next retry
         } else {
@@ -293,18 +616,20 @@ final class TunnelManager {
     }
 
     private func processExited(_ process: Process, id: UUID, stderr: String) {
-        pidRegistry.remove(process.processIdentifier)
+        let pid = process.processIdentifier
+        pidRegistry.remove(pid)
+        untrackWatchdog(pid: pid)
         // Ignore exits we caused ourselves via disconnect().
         guard processes[id] === process else { return }
         processes[id] = nil
-        watchdogs.removeValue(forKey: id)?.stop()
+        waitTasks.removeValue(forKey: id)?.cancel()
+        outputTails.removeValue(forKey: id)?.close()
+        connectedSince[id] = nil
         remoteStatus[id] = nil
-        stopMonitor(id)  // totals stay, so a reconnect keeps counting from where it left off
+        stopTrafficMonitoring(id: id)  // totals stay, so a reconnect keeps counting from where it left off
         if states[id] == .connected { retrying.insert(id) }
 
-        let lastLine = stderr.split(whereSeparator: \.isNewline).last
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        let message = (lastLine?.isEmpty == false ? lastLine : nil) ?? "Connection closed."
+        let message = OutputTail.extractError(from: stderr) ?? "Connection closed."
         if let tunnel = tunnels.first(where: { $0.id == id }) {
             fail(tunnel, message)
         }
@@ -341,11 +666,46 @@ final class TunnelManager {
     }
 
     /// After sleep the old SSH sessions are usually dead but won't notice for ~45s.
-    /// Kill them now and let the reconnect path rebuild them.
+    /// Kill them now and wake any sleeping retries immediately.
     private func restartAfterWake() {
+        restartAfterNetworkRecovery()
+    }
+
+    private func handleNetworkPathChange(_ path: NWPath) {
+        let newStatus = path.status
+        let newInterface = path.availableInterfaces.first?.type
+        defer {
+            lastPathStatus = newStatus
+            lastInterfaceType = newInterface
+        }
+        guard let previousStatus = lastPathStatus else { return }
+
+        if previousStatus != .satisfied && newStatus == .satisfied {
+            restartAfterNetworkRecovery()
+        } else if previousStatus == .satisfied && newStatus == .satisfied && newInterface != lastInterfaceType {
+            wakeSleepingReconnects()
+            for tunnel in tunnels where state(of: tunnel) == .connected {
+                recheckRemote(tunnel)
+            }
+        }
+    }
+
+    private func restartAfterNetworkRecovery() {
         for (id, process) in processes where states[id]?.isActive == true {
             retrying.insert(id)
             process.terminate()
+        }
+        wakeSleepingReconnects()
+    }
+
+    private func wakeSleepingReconnects() {
+        let sleepingIDs = Array(retryTasks.keys)
+        for id in sleepingIDs {
+            retryTasks.removeValue(forKey: id)?.cancel()
+            attempts[id] = 0
+            if let current = tunnels.first(where: { $0.id == id }), processes[id] == nil {
+                start(current)
+            }
         }
     }
 
@@ -367,5 +727,35 @@ final class TunnelManager {
         } catch {
             NSLog("LabTunnel: could not save tunnels: \(error)")
         }
+    }
+}
+
+private final class WaiterBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var sleepTask: Task<Void, Never>?
+    private var woken = false
+
+    func arm(continuation: CheckedContinuation<Void, Never>, sleepTask: Task<Void, Never>) -> Bool {
+        lock.withLock {
+            if woken { return false }
+            self.continuation = continuation
+            self.sleepTask = sleepTask
+            return true
+        }
+    }
+
+    func wake() {
+        let (cont, task) = lock.withLock { () -> (CheckedContinuation<Void, Never>?, Task<Void, Never>?) in
+            if woken { return (nil, nil) }
+            woken = true
+            let c = continuation
+            let t = sleepTask
+            continuation = nil
+            sleepTask = nil
+            return (c, t)
+        }
+        task?.cancel()
+        cont?.resume()
     }
 }

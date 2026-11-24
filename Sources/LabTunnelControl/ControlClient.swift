@@ -21,6 +21,7 @@ public struct ControlClient {
     }
 
     public func send(_ request: ControlRequest, timeoutSeconds: Int = 10) throws -> ControlResponse {
+        let payload = try JSONEncoder().encode(request)
         let fd: Int32
         do {
             fd = try UnixSocket.connect(path: socketURL.path, timeoutSeconds: timeoutSeconds)
@@ -29,7 +30,7 @@ public struct ControlClient {
         }
         defer { close(fd) }
 
-        UnixSocket.writeLine(fd, try JSONEncoder().encode(request))
+        UnixSocket.writeLine(fd, payload)
         guard let line = UnixSocket.readLine(fd) else { throw Failure.badResponse("no reply") }
         do {
             return try JSONDecoder().decode(ControlResponse.self, from: line)
@@ -39,6 +40,6 @@ public struct ControlClient {
     }
 
     public func isRunning() -> Bool {
-        (try? send(ControlRequest(command: "ping"), timeoutSeconds: 2))?.ok == true
+        (try? send(ControlRequest(command: "ping"), timeoutSeconds: 1))?.ok == true
     }
 }

@@ -21,9 +21,11 @@ Start the app before the CLI. Otherwise the CLI launches the registered LabTunne
 
 ## Invariants
 
-- `PIDRegistry.isLabTunnelSSH` recognizes tunnel processes by flags from `Tunnel.sshArguments`: `-N`, `ControlPath=none` and `-L 127.0.0.1:`. Change both together, or crash cleanup stops the wrong processes or none.
-- `Tunnel.sameConnection` decides which edits restart a live tunnel, and `TunnelManager.save` applies it for the menu and the CLI alike. `TunnelFields.changesConnection` in `CLI.swift` mirrors it to pick the exit code of `update`. Change them together.
-- `Watchdog` fires when its pipe's write end closes, which works only because `Process` passes children nothing beyond stdin, stdout and stderr. Spawn children through `Process`, not raw `fork` or `posix_spawn`.
+- `PIDRegistry` inspects processes via `sysctl(KERN_PROCARGS2)` and `proc_pidpath`, never by spawning `/bin/ps`. `PIDRegistry.isLabTunnelSSH` recognizes tunnel processes by flags from `Tunnel.sshArguments`: `-N`, `ControlPath=none` and `-L 127.0.0.1:` (split or joined). Change both together, or crash cleanup stops the wrong processes or none.
+- `Tunnel.sameConnection` decides which edits restart a live tunnel (`host`, `remoteHost`, `remotePort`, `localPort`, `useFreePortIfBusy`), and `TunnelManager.save` applies it for the menu and the CLI alike. `TunnelFields.changesConnection` in `CLI.swift` mirrors it to pick the exit code of `update`. Change them together.
+- One shared `Watchdog` tracks all active `ssh` PIDs over a lifeline pipe (`+pid`, `-pid`, `q`). `Watchdog` fires on EOF when its pipe's write end closes, which works only because `Process` passes children nothing beyond stdin, stdout and stderr. Spawn children through `Process`, not raw `fork` or `posix_spawn`.
+- One shared `TrafficMonitor` runs a single `/usr/bin/nettop` process over one PTY, started lazily only while at least one tunnel is connected and stopped when none are connected. Close the slave file descriptor in the parent right after `process.run()`, or EOF never arrives.
+- `InstanceLock` (`flock` on `instance.lock` in `Sources/LabTunnelControl/UnixSocket.swift`) and `ControlClient.isRunning()` enforce one running instance per data directory. Keep `TunnelManager` data directory private (`0700` when outside `/tmp`).
 - Older `tunnels.json` files must keep loading. Add a new `Tunnel` field to `CodingKeys` and decode it with `decodeIfPresent` and a default in `init(from:)`.
 - The control protocol in `Sources/LabTunnelControl/Protocol.swift` is a public contract for scripts and agents. Add fields, and keep existing names and meanings. When commands, flags, fields or exit codes change, update `CLI.usage` in `Sources/LabTunnelCLI/CLI.swift`, `skills/labtunnel/SKILL.md` and `README.md` in the same change.
 - `LabTunnelControl` is linked into both the app and the CLI. Keep it free of AppKit and SwiftUI.

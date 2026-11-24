@@ -6,7 +6,14 @@ import Foundation
 struct PIDRegistry {
     let url: URL
 
-    func add(_ pid: Int32) { save(pids() + [pid]) }
+    func add(_ pid: Int32) {
+        var list = pids()
+        if !list.contains(pid) {
+            list.append(pid)
+            save(list)
+        }
+    }
+
     func remove(_ pid: Int32) { save(pids().filter { $0 != pid }) }
     func clear() { save([]) }
 
@@ -14,29 +21,58 @@ struct PIDRegistry {
     /// A recycled PID could now belong to one of the user's own `ssh` sessions, so the
     /// executable path alone isn't enough: the command line must carry our tunnel flags.
     func reapOrphans() {
-        for pid in pids() where Self.isLabTunnelSSH(pid) {
+        let existing = pids()
+        if existing.isEmpty && !FileManager.default.fileExists(atPath: url.path) {
+            return
+        }
+        for pid in existing where Self.isLabTunnelSSH(pid) {
             kill(pid, SIGTERM)
         }
         clear()
     }
 
     static func isLabTunnelSSH(_ pid: Int32) -> Bool {
-        guard executablePath(of: pid) == "/usr/bin/ssh", let command = commandLine(of: pid) else { return false }
-        return command.contains(" -N ") && command.contains("ControlPath=none") && command.contains("-L 127.0.0.1:")
+        guard executablePath(of: pid) == "/usr/bin/ssh", let args = arguments(of: pid) else { return false }
+        guard args.contains("-N"), args.contains("ControlPath=none") else { return false }
+        return args.indices.contains { i in
+            (args[i] == "-L" && i + 1 < args.count && args[i + 1].hasPrefix("127.0.0.1:"))
+                || args[i].hasPrefix("-L127.0.0.1:")
+        }
+    }
+
+    static func arguments(of pid: Int32) -> [String]? {
+        guard pid > 0 else { return nil }
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+
+        var bufferSize = size + 1024
+        var buffer = [UInt8](repeating: 0, count: bufferSize)
+        guard sysctl(&mib, 3, &buffer, &bufferSize, nil, 0) == 0,
+              bufferSize > MemoryLayout<Int32>.size else { return nil }
+
+        let argc = buffer.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        guard argc >= 0 else { return nil }
+
+        var index = MemoryLayout<Int32>.size
+        // Skip exec_path and any trailing NUL alignment padding before argv[0].
+        while index < bufferSize && buffer[index] != 0 { index += 1 }
+        while index < bufferSize && buffer[index] == 0 { index += 1 }
+
+        var args: [String] = []
+        args.reserveCapacity(Int(argc))
+        for _ in 0..<argc {
+            guard index < bufferSize else { break }
+            let start = index
+            while index < bufferSize && buffer[index] != 0 { index += 1 }
+            args.append(String(decoding: buffer[start..<index], as: UTF8.self))
+            if index < bufferSize { index += 1 }
+        }
+        return args
     }
 
     static func commandLine(of pid: Int32) -> String? {
-        let ps = Process()
-        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        ps.arguments = ["-o", "command=", "-p", String(pid)]
-        let out = Pipe()
-        ps.standardOutput = out
-        ps.standardError = FileHandle.nullDevice
-        guard (try? ps.run()) != nil else { return nil }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        ps.waitUntilExit()
-        let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text?.isEmpty == false ? text : nil
+        arguments(of: pid)?.joined(separator: " ")
     }
 
     private func pids() -> [Int32] {

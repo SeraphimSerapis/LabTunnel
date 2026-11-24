@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/SeraphimSerapis/LabTunnel/releases/latest"><img src="https://img.shields.io/github/v/release/SeraphimSerapis/LabTunnel" alt="Latest release"></a>
-  <a href="https://github.com/SeraphimSerapis/LabTunnel/actions/workflows/ci.yml"><img src="https://github.com/SeraphimSerapis/LabTunnel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/SeraphimSerapis/LabTunnel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20silicon-black?logo=apple" alt="macOS 14+ on Apple silicon">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
@@ -25,7 +25,7 @@ It includes a `labtunnel` command and an agent skill. Scripts and coding agents 
 
    ```sh
    labtunnel add --name Grafana --host homelab --remote-port 3000 --connect
-   open http://127.0.0.1:3000
+   labtunnel open Grafana
    ```
 
 `homelab` is any host you can reach with `ssh homelab` without typing a password. You can also add tunnels in the menu instead of using the CLI.
@@ -72,20 +72,21 @@ cd LabTunnel
 
 ## Use the menu bar app
 
-Click the menu bar icon, then **Add Tunnel**.
+Click the menu bar icon, then **Add Tunnel** (`Cmd+N`).
 
 | Field | What it does |
 | --- | --- |
 | Name | Label in the menu. The CLI addresses tunnels by this name, so it must be unique, ignoring case. |
-| Group | Optional. Tunnels with the same group appear under one header with a button to connect or disconnect all of them. |
+| Group | Optional. Tunnels with the same group appear under one header (case-insensitive) with a button to connect or disconnect all of them. |
 | Host | Anything `ssh` accepts: a `~/.ssh/config` alias, a hostname, or `user@host`. The field suggests aliases from `~/.ssh/config`, including files it `Include`s. |
-| Remote port | The port the service listens on, on the host's `127.0.0.1`. |
+| Remote port | The port the service listens on, on the target host. |
 | Local port | The port on your Mac. Leave it empty to use the remote port. |
+| Remote bind | Under **Advanced**. The target host reachable from the SSH host. Defaults to `127.0.0.1`; set another IP or hostname when jumping through a bastion. |
 | Type | HTTP, HTTPS or TCP. HTTP and HTTPS tunnels get **Open in Browser** and **Copy URL**. TCP tunnels get **Copy Address**. |
 | Use a free port if the local port is busy | Picks the next free port above the local port when it is taken. Leave it off when the port must stay fixed, for example for an OAuth redirect URI. |
 | Connect when LabTunnel starts | Connects the tunnel at launch. Combine it with **Launch at Login** in the gear menu to get your tunnels back after a reboot. |
 
-The switch on each row connects or disconnects that tunnel. Any number can be on at once, and the menu bar icon shows how many are connected. Saving a new host or port for a connected tunnel reconnects it with the new settings.
+The switch on each row connects or disconnects that tunnel. Any number can be on at once, and the menu bar icon shows how many are connected. Connected rows offer a 1-click quick action to open the URL or copy the address, show when a fallback local port is in use, and let you **Re-check Remote**, **Duplicate…**, **Copy Error**, **Edit…** or **Delete** from the `…` menu. When you have 6 or more tunnels (or press `Cmd+F`), a search bar filters by name, host, remote host, group or port. Saving a new host, remote bind, or port for a connected tunnel reconnects it with the new settings.
 
 | Dot | Meaning |
 | --- | --- |
@@ -93,30 +94,40 @@ The switch on each row connects or disconnects that tunnel. Any number can be on
 | Orange | Connecting, or reconnecting after the connection dropped. |
 | Green | Connected. |
 | Yellow | Connected, but nothing answers on the remote port. |
-| Red | Failed. The row shows the error from `ssh`. |
+| Red | Failed. The row shows the error from `ssh` (hover for the full text). |
 
 A connected row shows the bytes sent (↑) and received (↓) through the tunnel, plus the current rate while data flows. The counts cover what your local apps sent and received, without SSH overhead. They carry over automatic reconnects and reset when you switch the tunnel off.
 
+The gear menu includes **Connect All** / **Disconnect All**, **Launch at Login**, **Set Up CLI & Agent Skill…**, **Open Config Folder**, and **Quit**.
+
 ## Use the CLI
 
-`labtunnel` controls the running app. If the app is not running, the first command starts it in the background.
+`labtunnel` controls the running app. If the app is not running, commands that talk to it start it in the background.
 
 ```sh
 labtunnel list
 labtunnel add --name Grafana --host homelab --remote-port 3000 --connect
+labtunnel open Grafana
 labtunnel status Grafana --json
+labtunnel recheck Grafana
 labtunnel update Grafana --local-port 4000
 labtunnel connect --group Monitoring
 labtunnel disconnect --all
+labtunnel hosts
+labtunnel doctor
+labtunnel version
 labtunnel help
 ```
 
-- A tunnel is addressed by its name (case-insensitive), its id, or an id prefix of at least 4 characters.
-- `connect` and `add --connect` wait until each tunnel is connected or has failed. The default timeout is 20 seconds. Change it with `--timeout SECONDS`, or return at once with `--no-wait`.
-- `update` reconnects a connected tunnel when its host or a port changes.
+- A tunnel is addressed by its name (case-insensitive), its id, or an id prefix of at least 4 characters. Use `--` to stop option parsing before names that start with `-`.
+- `connect`, `add --connect`, and `open` wait until each tunnel is connected or has failed. The default timeout is 20 seconds. Change it with `--timeout SECONDS`, or return at once with `--no-wait` (or pass `--no-connect` to `open` so it will not start an idle tunnel).
+- `update` reconnects a connected tunnel when its host, remote host, or ports change.
+- `recheck` re-probes whether the remote port is listening on connected tunnels.
+- `hosts` prints the SSH host aliases discovered from `~/.ssh/config`.
+- `doctor` checks app reachability, socket permissions, CLI/skill setup, `PATH`, `/usr/bin/ssh`, `ssh-agent` loaded key count, and tunnel health.
 - Names are unique, ignoring case. The CLI and the menu both reject a name that is already taken. If tunnels saved by an older version share a name, that name is ambiguous, and the error lists the ids to use instead.
 
-`labtunnel help` prints every command and flag.
+`labtunnel help` (or `-h` / `--help` on any subcommand) prints every command and flag.
 
 ### JSON output
 
@@ -144,6 +155,7 @@ With `--json`, every command prints one JSON object. This is `labtunnel status G
         "up" : 1520,
         "upRate" : 0
       },
+      "uptimeSeconds" : 42,
       "url" : "http://127.0.0.1:3000",
       "useFreePortIfBusy" : false
     }
@@ -156,8 +168,10 @@ With `--json`, every command prints one JSON object. This is `labtunnel status G
 | `state` | `idle`, `connecting`, `connected`, `reconnecting` or `failed`. |
 | `error` | The `ssh` error message. Present only when `state` is `failed`. |
 | `activeLocalPort` | The port in use while the tunnel is active. It differs from `localPort` after a free-port fallback. |
+| `remoteHost` | Target host on the SSH side, present when different from `127.0.0.1`. |
 | `url` | Present while connected, for `http` and `https` tunnels. |
 | `remote` | `listening`, `notListening` or `unknown`. Meaningful only while connected. |
+| `uptimeSeconds` | Elapsed connection time in seconds while connected. |
 | `traffic` | Bytes `up` and `down` since the tunnel was switched on, and the current rates in bytes per second. |
 
 A failed command has `"ok": false`, a readable `error`, and a `code`:
@@ -180,7 +194,7 @@ A failed command has `"ok": false`, a readable `error`, and a `code`:
 | 2 | Bad usage, an invalid value, or a name that is already taken. | `usage`, `invalid`, `exists` |
 | 3 | No tunnel matches, or a name matches more than one. | `not_found`, `ambiguous` |
 | 4 | The app is not reachable. | `unreachable` |
-| 5 | A tunnel failed or timed out while connecting. | |
+| 5 | A tunnel failed or timed out while connecting. | `connect_failed`, `timeout` |
 
 ## Agent skill
 
@@ -191,27 +205,28 @@ A failed command has `"ok": false`, a readable `error`, and a `code`:
 Each tunnel runs its own `ssh` process:
 
 ```sh
-/usr/bin/ssh -N -o BatchMode=yes -o ControlMaster=no -o ControlPath=none \
+/usr/bin/ssh -N -a -x -o BatchMode=yes -o ControlMaster=no -o ControlPath=none \
   -o ConnectTimeout=10 -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-  -L 127.0.0.1:<local>:127.0.0.1:<remote> -- <host>
+  -L 127.0.0.1:<local>:<remote-host>:<remote> -- <host>
 ```
 
 - The forward listens on your Mac's `127.0.0.1` only, so other devices on your network cannot use it.
-- On the host, `ssh` connects to `127.0.0.1:<remote>`. A service that listens only on `::1` or on a specific LAN address does not answer there.
+- On the host, `ssh` connects to `127.0.0.1:<remote>` by default (or `<remote-host>:<remote>` if configured). A service that listens only on `::1` or on a specific LAN address will not answer on `127.0.0.1` unless you set **Remote bind**.
 - Connection multiplexing is off. With `ControlMaster auto` in `~/.ssh/config`, `ssh` would hand the forward to a shared master process and exit, and LabTunnel could no longer stop the tunnel. The rest of your SSH config, such as `User`, `IdentityFile` and `ProxyJump`, still applies.
-- A tunnel counts as connected once its local port accepts connections. LabTunnel then opens one test connection through it. If the remote port is closed, `ssh` drops that connection, and the dot turns yellow. The remote service sees one short, empty connection each time this check runs, at connect and on **Re-check Remote**.
-- A tunnel that drops after it was up reconnects after 1, 2, 4, 8 and 16 seconds, then every 30 seconds. It also reconnects after the Mac wakes from sleep. A tunnel that fails before it ever connected stays failed. Switching a tunnel off stops the retries.
-- Quitting LabTunnel stops every tunnel. If the app crashes or is force-quit, a small watchdog process per tunnel stops its `ssh` right away. As a backup, the next launch stops any leftover tunnel processes it recorded.
-- Only one copy of LabTunnel runs at a time. A second copy exits right after launch.
-- The traffic counts come from `nettop`, which ships with macOS. It watches the loopback connections of each tunnel's `ssh` process.
+- A tunnel counts as connected once its `ssh` process is listening on the local port. LabTunnel then opens one test connection through it. If the remote port is closed, `ssh` drops that connection, and the dot turns yellow. The remote service sees one short, empty connection each time this check runs, at connect and on **Re-check Remote**. If traffic subsequently flows downstream, the yellow state clears automatically.
+- A tunnel that drops after it was up reconnects after 1, 2, 4, 8 and 16 seconds, then every 30 seconds. It also reacts immediately when the Mac wakes from sleep or when the active network path changes (`NWPathMonitor`). A tunnel that fails before it ever connected stays failed. Switching a tunnel off stops the retries.
+- Quitting LabTunnel stops every tunnel. If the app crashes or is force-quit, a single shared watchdog process stops all active `ssh` processes right away when its lifeline pipe closes. As a backup, the next launch stops any leftover tunnel processes it recorded.
+- Only one copy of LabTunnel runs per data directory, guarded by an `flock` lock (`instance.lock`) and control socket check. A second copy exits right after launch.
+- The traffic counts come from a single shared `nettop` process, started only while at least one tunnel is connected. It watches the loopback connections of each connected tunnel's `ssh` process.
 
-LabTunnel keeps its files in `~/Library/Application Support/LabTunnel/`:
+LabTunnel keeps its files in `~/Library/Application Support/LabTunnel/` (with mode `0700` on the directory):
 
 | File | Contents |
 | --- | --- |
 | `tunnels.json` | Your saved tunnels. Plain JSON that you can back up, or edit while the app is not running. |
 | `ssh-pids.json` | Process IDs of running tunnels, used for cleanup after a crash. |
+| `instance.lock` | Advisory `flock` lock preventing two instances from sharing one data directory. |
 | `control.sock` | The Unix socket the CLI talks to. Its mode is `0600`, so only your user can connect. |
 
 ## Troubleshooting
@@ -221,9 +236,9 @@ LabTunnel keeps its files in `~/Library/Application Support/LabTunnel/`:
 | `Host key verification failed.` | Run `ssh <host>` once in Terminal and accept the host key. |
 | `Permission denied (publickey)` | LabTunnel cannot type passwords or passphrases. Add your key to the agent with `ssh-add --apple-use-keychain <key file>`. `ssh -o BatchMode=yes <host> true` must succeed in Terminal. |
 | `Local port N is already in use.` | Another program listens on that port. `lsof -nP -iTCP:N -sTCP:LISTEN` shows which one. Choose a different local port, or turn on **Use a free port if the local port is busy**. |
-| Yellow dot | `ssh` is connected, but nothing accepts connections on `127.0.0.1:<remote>` on the host. Check that the service runs and listens on loopback or on all interfaces. |
+| Yellow dot | `ssh` is connected, but nothing accepts connections on `<remote-host>:<remote>` on the host. Check that the service runs and listens on loopback or on the configured **Remote bind** address. |
 | `LabTunnel is not reachable` (exit code 4) | Open LabTunnel.app once. A `labtunnel-cli` binary run from `.build/` starts whichever LabTunnel.app macOS has registered, which may not be your build, so start the app you want first. |
-| Launch at Login does not stay on | Move LabTunnel.app to `/Applications`. |
+| Launch at Login does not stay on | Move LabTunnel.app to `/Applications`, or approve LabTunnel in System Settings under General > Login Items. |
 
 ## Development
 
@@ -237,7 +252,7 @@ swift test                                     # unit and integration tests, no 
 | --- | --- |
 | `Sources/LabTunnel/` | The menu bar app: UI, tunnel manager, `ssh` and `nettop` processes, control socket server. |
 | `Sources/LabTunnelCLI/` | The `labtunnel` command: argument parsing and output. |
-| `Sources/LabTunnelControl/` | Code shared by the app and the CLI: the JSON protocol, the Unix socket, and the CLI and skill installer. |
+| `Sources/LabTunnelControl/` | Code shared by the app and the CLI: the JSON protocol, the Unix socket, `InstanceLock`, and the CLI and skill installer. |
 | `Tests/LabTunnelTests/` | XCTest suites. |
 | `skills/labtunnel/` | The agent skill. The build copies it into the app bundle. |
 | `scripts/` | Build, install, notarize and icon scripts. |

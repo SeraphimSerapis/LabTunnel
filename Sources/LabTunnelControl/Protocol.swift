@@ -1,7 +1,7 @@
 import Foundation
 
 /// Fields of a tunnel that `add` and `update` can set. Nil means "not specified".
-public struct TunnelFields: Codable, Equatable {
+public struct TunnelFields: Codable, Equatable, Sendable {
     public var name: String?
     public var host: String?
     public var remotePort: Int?
@@ -10,10 +10,11 @@ public struct TunnelFields: Codable, Equatable {
     public var group: String?
     public var connectOnLaunch: Bool?
     public var useFreePortIfBusy: Bool?
+    public var remoteHost: String?
 
     public init(name: String? = nil, host: String? = nil, remotePort: Int? = nil, localPort: Int? = nil,
                 scheme: String? = nil, group: String? = nil, connectOnLaunch: Bool? = nil,
-                useFreePortIfBusy: Bool? = nil) {
+                useFreePortIfBusy: Bool? = nil, remoteHost: String? = nil) {
         self.name = name
         self.host = host
         self.remotePort = remotePort
@@ -22,6 +23,7 @@ public struct TunnelFields: Codable, Equatable {
         self.group = group
         self.connectOnLaunch = connectOnLaunch
         self.useFreePortIfBusy = useFreePortIfBusy
+        self.remoteHost = remoteHost
     }
 
     public var isEmpty: Bool { self == TunnelFields() }
@@ -29,7 +31,7 @@ public struct TunnelFields: Codable, Equatable {
 
 /// One request line sent to the running app. Commands: ping, list, status, add, update,
 /// remove, connect, disconnect.
-public struct ControlRequest: Codable, Equatable {
+public struct ControlRequest: Codable, Equatable, Sendable {
     public var command: String
     /// Tunnel names or ids (or unique id prefixes).
     public var targets: [String]
@@ -39,19 +41,22 @@ public struct ControlRequest: Codable, Equatable {
     public var fields: TunnelFields
     /// For `add`: connect right after creating.
     public var connect: Bool
+    /// Server-side wait timeout in seconds, when supported by a command.
+    public var timeout: Double?
 
     public init(command: String, targets: [String] = [], group: String? = nil, all: Bool = false,
-                fields: TunnelFields = TunnelFields(), connect: Bool = false) {
+                fields: TunnelFields = TunnelFields(), connect: Bool = false, timeout: Double? = nil) {
         self.command = command
         self.targets = targets
         self.group = group
         self.all = all
         self.fields = fields
         self.connect = connect
+        self.timeout = timeout
     }
 }
 
-public struct TrafficStatus: Codable, Equatable {
+public struct TrafficStatus: Codable, Equatable, Sendable {
     public var up: Int
     public var down: Int
     public var upRate: Double
@@ -65,7 +70,7 @@ public struct TrafficStatus: Codable, Equatable {
     }
 }
 
-public struct TunnelStatus: Codable, Equatable {
+public struct TunnelStatus: Codable, Equatable, Sendable {
     public var id: String
     public var name: String
     public var host: String
@@ -86,11 +91,16 @@ public struct TunnelStatus: Codable, Equatable {
     /// unknown, listening or notListening. Only meaningful while connected.
     public var remote: String
     public var traffic: TrafficStatus
+    /// Target host when different from 127.0.0.1.
+    public var remoteHost: String?
+    /// Elapsed connection time in seconds while connected.
+    public var uptimeSeconds: Int?
 
     public init(id: String, name: String, host: String, remotePort: Int, localPort: Int, scheme: String,
                 group: String, connectOnLaunch: Bool, useFreePortIfBusy: Bool, state: String,
                 error: String? = nil, activeLocalPort: Int? = nil, url: String? = nil,
-                remote: String = "unknown", traffic: TrafficStatus = TrafficStatus()) {
+                remote: String = "unknown", traffic: TrafficStatus = TrafficStatus(),
+                remoteHost: String? = nil, uptimeSeconds: Int? = nil) {
         self.id = id
         self.name = name
         self.host = host
@@ -106,21 +116,28 @@ public struct TunnelStatus: Codable, Equatable {
         self.url = url
         self.remote = remote
         self.traffic = traffic
+        self.remoteHost = remoteHost
+        self.uptimeSeconds = uptimeSeconds
     }
 }
 
-public struct ControlResponse: Codable, Equatable {
+public struct ControlResponse: Codable, Equatable, Sendable {
     public var ok: Bool
     public var error: String?
     /// Machine-readable failure reason: usage, invalid, not_found, ambiguous, exists, internal.
     public var code: String?
     public var tunnels: [TunnelStatus]
+    public var hosts: [String]?
+    public var version: String?
 
-    public init(ok: Bool, error: String? = nil, code: String? = nil, tunnels: [TunnelStatus] = []) {
+    public init(ok: Bool, error: String? = nil, code: String? = nil, tunnels: [TunnelStatus] = [],
+                hosts: [String]? = nil, version: String? = nil) {
         self.ok = ok
         self.error = error
         self.code = code
         self.tunnels = tunnels
+        self.hosts = hosts
+        self.version = version
     }
 
     public static func success(_ tunnels: [TunnelStatus] = []) -> ControlResponse {
@@ -133,12 +150,20 @@ public struct ControlResponse: Codable, Equatable {
 }
 
 public enum ControlPaths {
+    public static var defaultDirectoryURL: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("LabTunnel")
+    }
+
     /// `~/Library/Application Support/LabTunnel/control.sock`. Sockets are limited to 104
     /// bytes of path, which this stays well under for normal home directories.
     public static var defaultSocketURL: URL {
-        FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("LabTunnel/control.sock")
+        defaultDirectoryURL.appendingPathComponent("control.sock")
+    }
+
+    public static var defaultLockURL: URL {
+        defaultDirectoryURL.appendingPathComponent("instance.lock")
     }
 
     public static let appBundleIdentifier = "dev.messerschmidt.labtunnel"

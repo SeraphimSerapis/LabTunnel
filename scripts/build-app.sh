@@ -15,6 +15,7 @@ cp "$BIN_DIR/LabTunnel" "$APP/Contents/MacOS/LabTunnel"
 # The CLI is built as labtunnel-cli because "labtunnel" and "LabTunnel" collide on a
 # case-insensitive volume. Inside the bundle they live in different folders.
 cp "$BIN_DIR/labtunnel-cli" "$APP/Contents/Helpers/labtunnel"
+strip -x "$APP/Contents/MacOS/LabTunnel" "$APP/Contents/Helpers/labtunnel"
 cp skills/labtunnel/SKILL.md "$APP/Contents/Resources/skill/SKILL.md"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
