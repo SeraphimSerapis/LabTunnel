@@ -153,17 +153,17 @@ public enum ControlPaths {
     public static var defaultDirectoryURL: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("LabTunnel")
+            .appendingPathComponent("LabTunnel", isDirectory: true)
     }
 
     /// `~/Library/Application Support/LabTunnel/control.sock`. Sockets are limited to 104
     /// bytes of path, which this stays well under for normal home directories.
     public static var defaultSocketURL: URL {
-        defaultDirectoryURL.appendingPathComponent("control.sock")
+        defaultDirectoryURL.appendingPathComponent("control.sock", isDirectory: false)
     }
 
     public static var defaultLockURL: URL {
-        defaultDirectoryURL.appendingPathComponent("instance.lock")
+        defaultDirectoryURL.appendingPathComponent("instance.lock", isDirectory: false)
     }
 
     public static let appBundleIdentifier = "dev.messerschmidt.labtunnel"

@@ -119,6 +119,7 @@ final class ProtocolAndModelTests: XCTestCase {
         let roundTripResp = try JSONDecoder().decode(ControlResponse.self, from: JSONEncoder().encode(response))
         XCTAssertEqual(roundTripResp, response)
 
+        XCTAssertTrue(ControlPaths.defaultDirectoryURL.hasDirectoryPath)
         XCTAssertEqual(ControlPaths.defaultSocketURL.deletingLastPathComponent(), ControlPaths.defaultDirectoryURL)
         XCTAssertEqual(ControlPaths.defaultLockURL, ControlPaths.defaultDirectoryURL.appendingPathComponent("instance.lock"))
     }
